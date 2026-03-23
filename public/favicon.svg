@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <rect width="256" height="256" rx="48" fill="#1B1B1F"/>
+  <rect x="16" y="16" width="224" height="224" rx="40" fill="none" stroke="#C41230" stroke-opacity="0.45" stroke-width="6"/>
+  <text x="128" y="138" text-anchor="middle" font-family="Barlow, DejaVu Sans, Arial" font-size="92" font-weight="900" fill="#C41230">BVN</text>
+  <text x="128" y="190" text-anchor="middle" font-family="Barlow, DejaVu Sans, Arial" font-size="40" font-weight="700" fill="#F0F0F5" fill-opacity="0.75">PCP</text>
+</svg>

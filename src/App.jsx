@@ -1085,6 +1085,13 @@ export default function App() {
     setTimeout(() => setToasts(prev => prev.filter(t => t.id !== id)), 5000);
   }
 
+  function mapOrder(o) {
+    return { id: o.id, client: o.client, orderNumber: o.order_number, deliveryDate: o.delivery_date, productionStart: o.production_start, productionEnd: o.production_end, status: o.status, observations: o.observations || '', items: o.items || [], itemsCompleted: o.items_completed || {} };
+  }
+  function mapItem(i) {
+    return { code: i.code, description: i.description, productionTime: i.production_time };
+  }
+
   async function loadData() {
     setLoading(true);
     setLoadError(false);
@@ -1097,8 +1104,8 @@ export default function App() {
       ]);
       if (itemsRes.error) throw itemsRes.error;
       if (ordersRes.error) throw ordersRes.error;
-      if (itemsRes.data) setRegisteredItems(itemsRes.data.map(i => ({ code: i.code, description: i.description, productionTime: i.production_time })));
-      if (ordersRes.data) setOrders(ordersRes.data.map(o => ({ id: o.id, client: o.client, orderNumber: o.order_number, deliveryDate: o.delivery_date, productionStart: o.production_start, productionEnd: o.production_end, status: o.status, observations: o.observations || '', items: o.items || [], itemsCompleted: o.items_completed || {} })));
+      if (itemsRes.data) setRegisteredItems(itemsRes.data.map(mapItem));
+      if (ordersRes.data) setOrders(ordersRes.data.map(mapOrder));
       if (clientsRes.data) setClientHistory(clientsRes.data.map(c => c.name));
       if (settingsRes.data) { setCalendarSettings(settingsRes.data.calendar_settings); setDayOverrides(settingsRes.data.day_overrides || {}); }
     } catch (e) {
@@ -1109,7 +1116,36 @@ export default function App() {
     }
   }
 
-  useEffect(() => { loadData(); }, []);
+  useEffect(() => {
+    loadData();
+
+    // Sincronização em tempo real — todos os usuários veem mudanças ao instante
+    const channel = supabase.channel('pcp-realtime')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'orders' }, payload => {
+        if (payload.eventType === 'INSERT') {
+          setOrders(prev => prev.find(o => String(o.id) === String(payload.new.id)) ? prev : [...prev, mapOrder(payload.new)]);
+        } else if (payload.eventType === 'UPDATE') {
+          setOrders(prev => prev.map(o => String(o.id) === String(payload.new.id) ? mapOrder(payload.new) : o));
+        } else if (payload.eventType === 'DELETE') {
+          setOrders(prev => prev.filter(o => String(o.id) !== String(payload.old.id)));
+        }
+      })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'items' }, payload => {
+        if (payload.eventType === 'INSERT') {
+          setRegisteredItems(prev => prev.find(i => i.code === payload.new.code) ? prev : [...prev, mapItem(payload.new)]);
+        } else if (payload.eventType === 'UPDATE') {
+          setRegisteredItems(prev => prev.map(i => i.code === payload.new.code ? mapItem(payload.new) : i));
+        } else if (payload.eventType === 'DELETE') {
+          setRegisteredItems(prev => prev.filter(i => i.code !== payload.old.code));
+        }
+      })
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'client_history' }, payload => {
+        setClientHistory(prev => prev.includes(payload.new.name) ? prev : [...prev, payload.new.name]);
+      })
+      .subscribe();
+
+    return () => { supabase.removeChannel(channel); };
+  }, []);
 
   async function addOrder(order) {
     setOrders(prev => [...prev, order]);

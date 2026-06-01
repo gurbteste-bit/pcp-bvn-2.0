@@ -1037,6 +1037,27 @@ function ExportPage({ orders, registeredItems }) {
 }
 
 // ============================================================
+// TOAST NOTIFICATION
+// ============================================================
+function Toast({ toasts }) {
+  if (!toasts.length) return null;
+  return (
+    <div style={{ position: "fixed", bottom: 24, right: 24, zIndex: 9999, display: "flex", flexDirection: "column", gap: 10 }}>
+      {toasts.map(t => (
+        <div key={t.id} style={{
+          padding: "12px 18px", borderRadius: 8, fontSize: 13, fontFamily: "'Barlow', sans-serif",
+          fontWeight: 600, boxShadow: "0 8px 24px rgba(0,0,0,0.5)",
+          background: t.type === "error" ? "#EF4444" : t.type === "warning" ? "#EAB308" : "#22C55E",
+          color: "#fff", maxWidth: 360, lineHeight: 1.4,
+        }}>
+          {t.type === "error" ? "⚠ " : "✓ "}{t.message}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ============================================================
 // MAIN APP
 // ============================================================
 export default function App() {
@@ -1050,35 +1071,58 @@ export default function App() {
   const [dayOverrides, setDayOverrides] = useState({});
   const [editingOrderId, setEditingOrderId] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState(false);
+  const [toasts, setToasts] = useState([]);
 
   const calendarSettingsRef = useRef(calendarSettings);
   const dayOverridesRef = useRef(dayOverrides);
   useEffect(() => { calendarSettingsRef.current = calendarSettings; }, [calendarSettings]);
   useEffect(() => { dayOverridesRef.current = dayOverrides; }, [dayOverrides]);
 
-  useEffect(() => {
-    async function loadData() {
+  function showToast(message, type = "error") {
+    const id = Date.now();
+    setToasts(prev => [...prev, { id, message, type }]);
+    setTimeout(() => setToasts(prev => prev.filter(t => t.id !== id)), 5000);
+  }
+
+  async function loadData() {
+    setLoading(true);
+    setLoadError(false);
+    try {
       const [itemsRes, ordersRes, clientsRes, settingsRes] = await Promise.all([
         supabase.from('items').select('*'),
         supabase.from('orders').select('*'),
         supabase.from('client_history').select('name'),
         supabase.from('settings').select('*').eq('id', 1).maybeSingle(),
       ]);
+      if (itemsRes.error) throw itemsRes.error;
+      if (ordersRes.error) throw ordersRes.error;
       if (itemsRes.data) setRegisteredItems(itemsRes.data.map(i => ({ code: i.code, description: i.description, productionTime: i.production_time })));
       if (ordersRes.data) setOrders(ordersRes.data.map(o => ({ id: o.id, client: o.client, orderNumber: o.order_number, deliveryDate: o.delivery_date, productionStart: o.production_start, productionEnd: o.production_end, status: o.status, observations: o.observations || '', items: o.items || [], itemsCompleted: o.items_completed || {} })));
       if (clientsRes.data) setClientHistory(clientsRes.data.map(c => c.name));
       if (settingsRes.data) { setCalendarSettings(settingsRes.data.calendar_settings); setDayOverrides(settingsRes.data.day_overrides || {}); }
+    } catch (e) {
+      console.error("Erro ao carregar dados:", e);
+      setLoadError(true);
+    } finally {
       setLoading(false);
     }
-    loadData();
-  }, []);
+  }
+
+  useEffect(() => { loadData(); }, []);
 
   async function addOrder(order) {
     setOrders(prev => [...prev, order]);
-    await supabase.from('orders').insert({ id: order.id, client: order.client, order_number: order.orderNumber, delivery_date: order.deliveryDate, production_start: order.productionStart, production_end: order.productionEnd, status: order.status, observations: order.observations, items: order.items, items_completed: order.itemsCompleted });
+    const { error } = await supabase.from('orders').insert({ id: order.id, client: order.client, order_number: order.orderNumber, delivery_date: order.deliveryDate, production_start: order.productionStart, production_end: order.productionEnd, status: order.status, observations: order.observations, items: order.items, items_completed: order.itemsCompleted });
+    if (error) {
+      setOrders(prev => prev.filter(o => o.id !== order.id));
+      showToast("Erro ao salvar pedido. Tente novamente.");
+      console.error(error);
+    }
   }
   async function updateOrder(id, changes) {
-    setOrders(prev => prev.map(o => o.id === id ? { ...o, ...changes } : o));
+    const prev = orders.find(o => o.id === id);
+    setOrders(p => p.map(o => o.id === id ? { ...o, ...changes } : o));
     const db = {};
     if (changes.client !== undefined) db.client = changes.client;
     if (changes.orderNumber !== undefined) db.order_number = changes.orderNumber;
@@ -1089,47 +1133,84 @@ export default function App() {
     if (changes.observations !== undefined) db.observations = changes.observations;
     if (changes.items !== undefined) db.items = changes.items;
     if (changes.itemsCompleted !== undefined) db.items_completed = changes.itemsCompleted;
-    await supabase.from('orders').update(db).eq('id', String(id));
+    const { error } = await supabase.from('orders').update(db).eq('id', String(id));
+    if (error) {
+      if (prev) setOrders(p => p.map(o => o.id === id ? prev : o));
+      showToast("Erro ao atualizar pedido. Alteração desfeita.");
+      console.error(error);
+    }
   }
   async function addItem(item) {
     setRegisteredItems(prev => [...prev, item]);
-    await supabase.from('items').insert({ code: item.code, description: item.description, production_time: item.productionTime });
+    const { error } = await supabase.from('items').insert({ code: item.code, description: item.description, production_time: item.productionTime });
+    if (error) {
+      setRegisteredItems(prev => prev.filter(i => i.code !== item.code));
+      showToast("Erro ao salvar item. Tente novamente.");
+      console.error(error);
+    }
   }
   async function updateItem(originalCode, newItem) {
-    setRegisteredItems(prev => prev.map(i => i.code === originalCode ? newItem : i));
+    const prev = registeredItems.find(i => i.code === originalCode);
+    setRegisteredItems(p => p.map(i => i.code === originalCode ? newItem : i));
+    let error;
     if (originalCode !== newItem.code) {
-      await supabase.from('items').delete().eq('code', originalCode);
-      await supabase.from('items').insert({ code: newItem.code, description: newItem.description, production_time: newItem.productionTime });
+      const r1 = await supabase.from('items').delete().eq('code', originalCode);
+      if (r1.error) { error = r1.error; } else {
+        const r2 = await supabase.from('items').insert({ code: newItem.code, description: newItem.description, production_time: newItem.productionTime });
+        if (r2.error) error = r2.error;
+      }
     } else {
-      await supabase.from('items').update({ code: newItem.code, description: newItem.description, production_time: newItem.productionTime }).eq('code', originalCode);
+      const r = await supabase.from('items').update({ description: newItem.description, production_time: newItem.productionTime }).eq('code', originalCode);
+      if (r.error) error = r.error;
+    }
+    if (error) {
+      if (prev) setRegisteredItems(p => p.map(i => i.code === newItem.code ? prev : i));
+      showToast("Erro ao atualizar item. Alteração desfeita.");
+      console.error(error);
     }
   }
   async function deleteItem(code) {
-    setRegisteredItems(prev => prev.filter(i => i.code !== code));
-    await supabase.from('items').delete().eq('code', code);
+    const prev = registeredItems.find(i => i.code === code);
+    setRegisteredItems(p => p.filter(i => i.code !== code));
+    const { error } = await supabase.from('items').delete().eq('code', code);
+    if (error) {
+      if (prev) setRegisteredItems(p => [...p, prev]);
+      showToast("Erro ao excluir item. Tente novamente.");
+      console.error(error);
+    }
   }
   async function addClient(name) {
     if (clientHistory.includes(name)) return;
     setClientHistory(prev => [...prev, name]);
-    await supabase.from('client_history').insert({ name }).then(({ error }) => { if (error && error.code !== '23505') console.error(error); });
+    const { error } = await supabase.from('client_history').insert({ name });
+    if (error && error.code !== '23505') console.error(error);
   }
   async function saveCalendarSettings(newSettings) {
+    const prev = calendarSettings;
     setCalendarSettings(newSettings);
-    await supabase.from('settings').upsert({ id: 1, calendar_settings: newSettings, day_overrides: dayOverridesRef.current });
+    const { error } = await supabase.from('settings').upsert({ id: 1, calendar_settings: newSettings, day_overrides: dayOverridesRef.current });
+    if (error) {
+      setCalendarSettings(prev);
+      showToast("Erro ao salvar configurações de calendário.");
+      console.error(error);
+    }
   }
   async function saveDayOverrides(newOverrides) {
+    const prev = dayOverrides;
     setDayOverrides(newOverrides);
-    await supabase.from('settings').upsert({ id: 1, calendar_settings: calendarSettingsRef.current, day_overrides: newOverrides });
+    const { error } = await supabase.from('settings').upsert({ id: 1, calendar_settings: calendarSettingsRef.current, day_overrides: newOverrides });
+    if (error) {
+      setDayOverrides(prev);
+      showToast("Erro ao salvar exceções do calendário.");
+      console.error(error);
+    }
   }
 
   function handleLogin(user) { setCurrentUser(user); setActivePage("demand"); }
   function handleLogout() { setCurrentUser(null); setActivePage("demand"); }
 
   if (!currentUser) {
-    return <>
-      <link href="https://fonts.googleapis.com/css2?family=Barlow:wght@400;500;600;700;800;900&family=Barlow+Condensed:wght@400;500;600;700;800;900&display=swap" rel="stylesheet" />
-      <LoginPage users={users} onLogin={handleLogin} />
-    </>;
+    return <LoginPage users={users} onLogin={handleLogin} />;
   }
 
   if (loading) {
@@ -1141,9 +1222,22 @@ export default function App() {
     );
   }
 
+  if (loadError) {
+    return (
+      <div style={{ width: "100vw", height: "100vh", display: "flex", alignItems: "center", justifyContent: "center", background: C.dark, flexDirection: "column", gap: 20 }}>
+        <div style={{ fontSize: 32, fontWeight: 900, color: C.red, fontFamily: "'Barlow Condensed', sans-serif" }}>BVN PCP</div>
+        <div style={{ fontSize: 15, color: C.danger, fontFamily: "'Barlow', sans-serif", fontWeight: 600 }}>Erro ao conectar com o banco de dados.</div>
+        <div style={{ fontSize: 13, color: C.textMuted, fontFamily: "'Barlow', sans-serif" }}>Verifique sua conexão e tente novamente.</div>
+        <button onClick={loadData} style={{ padding: "12px 28px", borderRadius: 8, border: "none", background: C.red, color: "#fff", cursor: "pointer", fontSize: 15, fontWeight: 800, fontFamily: "'Barlow Condensed', sans-serif", letterSpacing: "0.05em" }}>
+          Tentar Novamente
+        </button>
+      </div>
+    );
+  }
+
   return (
     <>
-      <link href="https://fonts.googleapis.com/css2?family=Barlow:wght@400;500;600;700;800;900&family=Barlow+Condensed:wght@400;500;600;700;800;900&display=swap" rel="stylesheet" />
+      <Toast toasts={toasts} />
       <div style={{ display: "flex", height: "100vh", background: C.dark, fontFamily: F, overflow: "hidden" }}>
         <Sidebar activePage={activePage} setActivePage={setActivePage} currentUser={currentUser} onLogout={handleLogout} />
         <div style={{ flex: 1, overflow: "auto" }}>

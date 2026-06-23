@@ -1109,12 +1109,56 @@ export default function App() {
   useEffect(() => { dayOverridesRef.current = dayOverrides; }, [dayOverrides]);
   useEffect(() => { offlineModeRef.current = offlineMode; }, [offlineMode]);
 
-  // Espelha o estado no localStorage sempre que houver mudança (após a carga inicial)
-  useEffect(() => { if (syncedRef.current) LS.set(LSK.orders,   orders); }, [orders]);
-  useEffect(() => { if (syncedRef.current) LS.set(LSK.items,    registeredItems); }, [registeredItems]);
-  useEffect(() => { if (syncedRef.current) LS.set(LSK.clients,  clientHistory); }, [clientHistory]);
-  useEffect(() => { if (syncedRef.current) LS.set(LSK.cal,      calendarSettings); }, [calendarSettings]);
-  useEffect(() => { if (syncedRef.current) LS.set(LSK.overrides,dayOverrides); }, [dayOverrides]);
+  // Sincroniza estado para localStorage com debounce (evita sobrecarga)
+  useEffect(() => {
+    if (!syncedRef.current) return;
+    const timer = setTimeout(() => {
+      try {
+        if (orders && orders.length >= 0) LS.set(LSK.orders, orders);
+      } catch (e) { console.warn('Erro ao sincronizar orders:', e); }
+    }, 800);
+    return () => clearTimeout(timer);
+  }, [orders]);
+
+  useEffect(() => {
+    if (!syncedRef.current) return;
+    const timer = setTimeout(() => {
+      try {
+        if (registeredItems && registeredItems.length >= 0) LS.set(LSK.items, registeredItems);
+      } catch (e) { console.warn('Erro ao sincronizar items:', e); }
+    }, 800);
+    return () => clearTimeout(timer);
+  }, [registeredItems]);
+
+  useEffect(() => {
+    if (!syncedRef.current) return;
+    const timer = setTimeout(() => {
+      try {
+        if (clientHistory && clientHistory.length >= 0) LS.set(LSK.clients, clientHistory);
+      } catch (e) { console.warn('Erro ao sincronizar clients:', e); }
+    }, 800);
+    return () => clearTimeout(timer);
+  }, [clientHistory]);
+
+  useEffect(() => {
+    if (!syncedRef.current) return;
+    const timer = setTimeout(() => {
+      try {
+        if (calendarSettings) LS.set(LSK.cal, calendarSettings);
+      } catch (e) { console.warn('Erro ao sincronizar calendário:', e); }
+    }, 800);
+    return () => clearTimeout(timer);
+  }, [calendarSettings]);
+
+  useEffect(() => {
+    if (!syncedRef.current) return;
+    const timer = setTimeout(() => {
+      try {
+        if (dayOverrides) LS.set(LSK.overrides, dayOverrides);
+      } catch (e) { console.warn('Erro ao sincronizar overrides:', e); }
+    }, 800);
+    return () => clearTimeout(timer);
+  }, [dayOverrides]);
 
   function showToast(message, type = "error") {
     const id = Date.now();
@@ -1188,38 +1232,74 @@ export default function App() {
 
   useEffect(() => {
     loadData();
+    let subscription;
 
     // Sincronização em tempo real — todos os usuários veem mudanças ao instante
-    const channel = supabase.channel('pcp-realtime')
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'orders' }, payload => {
-        if (payload.eventType === 'INSERT') {
-          setOrders(prev => prev.find(o => String(o.id) === String(payload.new.id)) ? prev : [...prev, mapOrder(payload.new)]);
-        } else if (payload.eventType === 'UPDATE') {
+    const setupSubscription = async () => {
+      const channel = supabase.channel('pcp-realtime-v2', { config: { broadcast: { self: false } } })
+        .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'orders' }, payload => {
+          // Previne duplicatas em INSERTs: verifica se o ID já existe
+          setOrders(prev => {
+            const exists = prev.some(o => String(o.id) === String(payload.new.id));
+            return exists ? prev : [...prev, mapOrder(payload.new)];
+          });
+        })
+        .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'orders' }, payload => {
           setOrders(prev => prev.map(o => String(o.id) === String(payload.new.id) ? mapOrder(payload.new) : o));
-        } else if (payload.eventType === 'DELETE') {
+        })
+        .on('postgres_changes', { event: 'DELETE', schema: 'public', table: 'orders' }, payload => {
           setOrders(prev => prev.filter(o => String(o.id) !== String(payload.old.id)));
-        }
-      })
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'items' }, payload => {
-        if (payload.eventType === 'INSERT') {
-          setRegisteredItems(prev => prev.find(i => i.code === payload.new.code) ? prev : [...prev, mapItem(payload.new)]);
-        } else if (payload.eventType === 'UPDATE') {
+        })
+        .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'items' }, payload => {
+          setRegisteredItems(prev => {
+            const exists = prev.some(i => i.code === payload.new.code);
+            return exists ? prev : [...prev, mapItem(payload.new)];
+          });
+        })
+        .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'items' }, payload => {
           setRegisteredItems(prev => prev.map(i => i.code === payload.new.code ? mapItem(payload.new) : i));
-        } else if (payload.eventType === 'DELETE') {
+        })
+        .on('postgres_changes', { event: 'DELETE', schema: 'public', table: 'items' }, payload => {
           setRegisteredItems(prev => prev.filter(i => i.code !== payload.old.code));
-        }
-      })
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'client_history' }, payload => {
-        setClientHistory(prev => prev.includes(payload.new.name) ? prev : [...prev, payload.new.name]);
-      })
-      .subscribe();
+        })
+        .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'client_history' }, payload => {
+          setClientHistory(prev => prev.includes(payload.new.name) ? prev : [...prev, payload.new.name]);
+        })
+        .subscribe((status) => {
+          if (status === 'SUBSCRIBED') console.log('✓ Realtime sync conectado');
+        });
+      subscription = channel;
+    };
 
-    return () => { supabase.removeChannel(channel); };
+    setupSubscription().catch(err => console.error('Erro ao conectar realtime:', err));
+
+    return () => {
+      if (subscription) {
+        supabase.removeChannel(subscription);
+      }
+    };
   }, []);
 
   async function addOrder(order) {
+    // Validar dados antes de inserir
+    if (!order.id || !order.client || !order.orderNumber) {
+      showToast('Pedido incompleto. Verifique os dados.');
+      return;
+    }
+    
     setOrders(prev => [...prev, order]);
-    const { error } = await supabase.from('orders').insert({ id: order.id, client: order.client, order_number: order.orderNumber, delivery_date: order.deliveryDate, production_start: order.productionStart, production_end: order.productionEnd, status: order.status, observations: order.observations, items: order.items, items_completed: order.itemsCompleted });
+    const { error } = await supabase.from('orders').insert({ 
+      id: String(order.id), 
+      client: order.client, 
+      order_number: order.orderNumber, 
+      delivery_date: order.deliveryDate, 
+      production_start: order.productionStart, 
+      production_end: order.productionEnd, 
+      status: order.status, 
+      observations: order.observations, 
+      items: order.items, 
+      items_completed: order.itemsCompleted 
+    });
     if (error) handleSaveError(error, () => setOrders(prev => prev.filter(o => o.id !== order.id)), "Erro ao salvar pedido. Tente novamente.");
   }
   async function updateOrder(id, changes) {
@@ -1289,9 +1369,16 @@ export default function App() {
 
   // Helper: trata erros de save respeitando modo offline
   function handleSaveError(error, rollback, msg) {
-    if (!offlineModeRef.current) { rollback(); showToast(msg); }
-    else { showToast("Modo offline — alteração salva localmente.", "warning"); }
-    console.error(error);
+    console.error('SaveError:', error);
+    
+    // Se estamos em modo offline, salva no localStorage e aguarda reconexão
+    if (offlineModeRef.current || error?.status === 0 || error?.message?.includes('network')) {
+      showToast("Modo offline — alteração salva localmente. Sincronizará ao reconectar.", "warning");
+    } else {
+      // Se houver erro no servidor, desfaz a alteração
+      if (rollback) rollback();
+      showToast(msg || "Erro ao salvar. Alteração desfeita.", "error");
+    }
   }
 
   function handleLogin(user) { setCurrentUser(user); setActivePage("demand"); }

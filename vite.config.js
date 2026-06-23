@@ -3,8 +3,26 @@ import react from '@vitejs/plugin-react'
 import { VitePWA } from 'vite-plugin-pwa'
 
 export default defineConfig({
+  build: {
+    target: 'es2020',
+    minify: 'terser',
+    rollupOptions: {
+      output: {
+        manualChunks: undefined
+      }
+    }
+  },
   plugins: [
-    react(),
+    react({
+      jsxRuntime: 'automatic',
+      babel: {
+        parserOpts: {
+          sourceType: 'module',
+          allowImportExportEverywhere: true,
+          allowReturnOutsideFunction: true
+        }
+      }
+    }),
     VitePWA({
       registerType: 'autoUpdate',
       includeAssets: [

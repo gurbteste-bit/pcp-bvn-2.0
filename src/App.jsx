@@ -683,16 +683,16 @@ function OpenDemandsPage({ orders, updateOrder, setEditingOrderId, setActivePage
 // ============================================================
 function ItemsPage({ registeredItems, addItem, updateItem, deleteItem }) {
   const [code, setCode] = useState(""); const [desc, setDesc] = useState(""); const [time, setTime] = useState("");
-  const [search, setSearch] = useState(""); const [editIdx, setEditIdx] = useState(null);
+  const [search, setSearch] = useState(""); const [editCode, setEditCode] = useState(null); // código original em edição (não índice)
+  const [confirm, setConfirm] = useState(null);
   const filtered = registeredItems.filter(i => i.code.toLowerCase().includes(search.toLowerCase()) || i.description.toLowerCase().includes(search.toLowerCase()));
 
   function saveItem() {
     if (!code || !desc || !time) return alert("Preencha todos os campos.");
     const mins = parseInt(time); if (!mins || mins < 1) return alert("Tempo deve ser positivo.");
-    if (editIdx !== null) {
-      const originalCode = registeredItems[editIdx].code;
-      updateItem(originalCode, { code: code.toUpperCase(), description: desc, productionTime: mins });
-      setEditIdx(null);
+    if (editCode !== null) {
+      updateItem(editCode, { code: code.toUpperCase(), description: desc, productionTime: mins });
+      setEditCode(null);
     } else {
       if (registeredItems.find(i => i.code === code.toUpperCase())) return alert("Código já cadastrado.");
       addItem({ code: code.toUpperCase(), description: desc, productionTime: mins });
@@ -700,8 +700,17 @@ function ItemsPage({ registeredItems, addItem, updateItem, deleteItem }) {
     setCode(""); setDesc(""); setTime("");
   }
 
+  function requestDelete(itemCode) {
+    setConfirm({
+      message: `Excluir o item "${itemCode}" do catálogo? Esta ação não pode ser desfeita.`,
+      onYes: () => { deleteItem(itemCode); setConfirm(null); },
+      onNo: () => setConfirm(null),
+    });
+  }
+
   return (
     <div style={{ padding: 32, maxWidth: 960, margin: "0 auto" }}>
+      <ConfirmDialog open={!!confirm} message={confirm?.message || ""} onYes={confirm?.onYes} onNo={confirm?.onNo} />
       <h1 style={{ margin: "0 0 28px", fontSize: 26, fontWeight: 800, color: C.text, fontFamily: FH, letterSpacing: "0.02em" }}>Cadastro de Itens</h1>
       <div style={{ background: C.darkCard, borderRadius: 10, border: `1px solid ${C.border}`, padding: 24, marginBottom: 28 }}>
         <div style={{ display: "grid", gridTemplateColumns: "1fr 2fr 1fr", gap: 14, marginBottom: 14 }}>
@@ -710,8 +719,8 @@ function ItemsPage({ registeredItems, addItem, updateItem, deleteItem }) {
           <Field label="Tempo de Produção (min)"><input type="number" min="1" value={time} onChange={e => setTime(e.target.value)} placeholder="Minutos" style={inputStyle} /></Field>
         </div>
         <div style={{ display: "flex", gap: 10 }}>
-          <Btn onClick={saveItem}>{editIdx !== null ? "Atualizar" : "Salvar"}</Btn>
-          {editIdx !== null && <Btn variant="ghost" onClick={() => { setEditIdx(null); setCode(""); setDesc(""); setTime(""); }}>Cancelar</Btn>}
+          <Btn onClick={saveItem}>{editCode !== null ? "Atualizar" : "Salvar"}</Btn>
+          {editCode !== null && <Btn variant="ghost" onClick={() => { setEditCode(null); setCode(""); setDesc(""); setTime(""); }}>Cancelar</Btn>}
         </div>
       </div>
       <div style={{ background: C.darkCard, borderRadius: 10, border: `1px solid ${C.border}` }}>
@@ -724,15 +733,14 @@ function ItemsPage({ registeredItems, addItem, updateItem, deleteItem }) {
         </div>
         <div style={{ maxHeight: 380, overflow: "auto" }}>
           {filtered.map((item, idx) => {
-            const ri = registeredItems.indexOf(item);
             return (
-              <div key={idx} style={{ display: "grid", gridTemplateColumns: "2fr 4fr 1.5fr 70px", padding: "11px 20px", borderBottom: `1px solid ${C.border}`, fontSize: 13, color: C.text, fontFamily: F, alignItems: "center" }}>
+              <div key={item.code} style={{ display: "grid", gridTemplateColumns: "2fr 4fr 1.5fr 70px", padding: "11px 20px", borderBottom: `1px solid ${C.border}`, fontSize: 13, color: C.text, fontFamily: F, alignItems: "center" }}>
                 <span style={{ fontWeight: 700, color: C.red }}>{item.code}</span>
                 <span>{item.description}</span>
                 <span>{fmtMin(item.productionTime)}</span>
                 <div style={{ display: "flex", gap: 5 }}>
-                  <button onClick={() => { setCode(item.code); setDesc(item.description); setTime(String(item.productionTime)); setEditIdx(ri); }} style={{ background: "none", border: "none", color: C.textMuted, cursor: "pointer", fontSize: 13 }}>✎</button>
-                  <button onClick={() => deleteItem(item.code)} style={{ background: "none", border: "none", color: C.danger, cursor: "pointer", fontSize: 13 }}>✕</button>
+                  <button onClick={() => { setCode(item.code); setDesc(item.description); setTime(String(item.productionTime)); setEditCode(item.code); }} style={{ background: "none", border: "none", color: C.textMuted, cursor: "pointer", fontSize: 13 }}>✎</button>
+                  <button onClick={() => requestDelete(item.code)} style={{ background: "none", border: "none", color: C.danger, cursor: "pointer", fontSize: 13 }}>✕</button>
                 </div>
               </div>
             );
@@ -1058,6 +1066,24 @@ function Toast({ toasts }) {
 }
 
 // ============================================================
+// LOCAL STORAGE — Backup para funcionar sem conexão com Supabase
+// Supabase free tier pausa projetos após 7 dias sem acesso.
+// Esse cache garante que os dados não desaparecem quando isso ocorre.
+// ============================================================
+const LS = {
+  get(k, d) { try { const v = localStorage.getItem(k); return v !== null ? JSON.parse(v) : d; } catch { return d; } },
+  set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch(e) { console.warn('localStorage cheio ou bloqueado:', e); } },
+};
+const LSK = {
+  orders:   'pcp_bvn_orders',
+  items:    'pcp_bvn_items',
+  clients:  'pcp_bvn_clients',
+  cal:      'pcp_bvn_cal',
+  overrides:'pcp_bvn_overrides',
+  sync:     'pcp_bvn_lastsync',
+};
+
+// ============================================================
 // MAIN APP
 // ============================================================
 export default function App() {
@@ -1073,11 +1099,22 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState(false);
   const [toasts, setToasts] = useState([]);
+  const [offlineMode, setOfflineMode] = useState(false);
 
   const calendarSettingsRef = useRef(calendarSettings);
   const dayOverridesRef = useRef(dayOverrides);
+  const offlineModeRef = useRef(false);
+  const syncedRef = useRef(false); // ativa o espelho após a primeira carga
   useEffect(() => { calendarSettingsRef.current = calendarSettings; }, [calendarSettings]);
   useEffect(() => { dayOverridesRef.current = dayOverrides; }, [dayOverrides]);
+  useEffect(() => { offlineModeRef.current = offlineMode; }, [offlineMode]);
+
+  // Espelha o estado no localStorage sempre que houver mudança (após a carga inicial)
+  useEffect(() => { if (syncedRef.current) LS.set(LSK.orders,   orders); }, [orders]);
+  useEffect(() => { if (syncedRef.current) LS.set(LSK.items,    registeredItems); }, [registeredItems]);
+  useEffect(() => { if (syncedRef.current) LS.set(LSK.clients,  clientHistory); }, [clientHistory]);
+  useEffect(() => { if (syncedRef.current) LS.set(LSK.cal,      calendarSettings); }, [calendarSettings]);
+  useEffect(() => { if (syncedRef.current) LS.set(LSK.overrides,dayOverrides); }, [dayOverrides]);
 
   function showToast(message, type = "error") {
     const id = Date.now();
@@ -1104,13 +1141,46 @@ export default function App() {
       ]);
       if (itemsRes.error) throw itemsRes.error;
       if (ordersRes.error) throw ordersRes.error;
-      if (itemsRes.data) setRegisteredItems(itemsRes.data.map(mapItem));
+      // Itens: se Supabase retornar array vazio mas localStorage tiver dados,
+      // usa cache local e avisa — evita apagar o catálogo por falha temporária
+      const newItems = itemsRes.data?.map(mapItem) ?? [];
+      const cachedItems = LS.get(LSK.items, []);
+      if (newItems.length > 0) {
+        setRegisteredItems(newItems);
+      } else if (cachedItems.length > 0) {
+        setRegisteredItems(cachedItems);
+        showToast("Catálogo de itens vazio no servidor — cache local restaurado.", "warning");
+      }
+
       if (ordersRes.data) setOrders(ordersRes.data.map(mapOrder));
       if (clientsRes.data) setClientHistory(clientsRes.data.map(c => c.name));
       if (settingsRes.data) { setCalendarSettings(settingsRes.data.calendar_settings); setDayOverrides(settingsRes.data.day_overrides || {}); }
+      syncedRef.current = true; // ativa o espelho localStorage
+      setOfflineMode(false);
+      LS.set(LSK.sync, new Date().toISOString());
     } catch (e) {
-      console.error("Erro ao carregar dados:", e);
-      setLoadError(true);
+      console.error("Erro ao carregar dados do Supabase:", e);
+      // Tenta carregar do cache local (localStorage)
+      const cached = {
+        orders:   LS.get(LSK.orders,   []),
+        items:    LS.get(LSK.items,    []),
+        clients:  LS.get(LSK.clients,  []),
+        cal:      LS.get(LSK.cal,      null),
+        overrides:LS.get(LSK.overrides,{}),
+        sync:     LS.get(LSK.sync,     null),
+      };
+      if (cached.orders.length || cached.items.length) {
+        setOrders(cached.orders);
+        setRegisteredItems(cached.items);
+        setClientHistory(cached.clients);
+        if (cached.cal) setCalendarSettings(cached.cal);
+        setDayOverrides(cached.overrides);
+        syncedRef.current = true;
+        setOfflineMode(true);
+        console.info("Dados carregados do cache local. Último sync:", cached.sync);
+      } else {
+        setLoadError(true);
+      }
     } finally {
       setLoading(false);
     }
@@ -1150,11 +1220,7 @@ export default function App() {
   async function addOrder(order) {
     setOrders(prev => [...prev, order]);
     const { error } = await supabase.from('orders').insert({ id: order.id, client: order.client, order_number: order.orderNumber, delivery_date: order.deliveryDate, production_start: order.productionStart, production_end: order.productionEnd, status: order.status, observations: order.observations, items: order.items, items_completed: order.itemsCompleted });
-    if (error) {
-      setOrders(prev => prev.filter(o => o.id !== order.id));
-      showToast("Erro ao salvar pedido. Tente novamente.");
-      console.error(error);
-    }
+    if (error) handleSaveError(error, () => setOrders(prev => prev.filter(o => o.id !== order.id)), "Erro ao salvar pedido. Tente novamente.");
   }
   async function updateOrder(id, changes) {
     const prev = orders.find(o => o.id === id);
@@ -1170,50 +1236,37 @@ export default function App() {
     if (changes.items !== undefined) db.items = changes.items;
     if (changes.itemsCompleted !== undefined) db.items_completed = changes.itemsCompleted;
     const { error } = await supabase.from('orders').update(db).eq('id', String(id));
-    if (error) {
-      if (prev) setOrders(p => p.map(o => o.id === id ? prev : o));
-      showToast("Erro ao atualizar pedido. Alteração desfeita.");
-      console.error(error);
-    }
+    if (error) handleSaveError(error, () => { if (prev) setOrders(p => p.map(o => o.id === id ? prev : o)); }, "Erro ao atualizar pedido. Alteração desfeita.");
   }
   async function addItem(item) {
     setRegisteredItems(prev => [...prev, item]);
     const { error } = await supabase.from('items').insert({ code: item.code, description: item.description, production_time: item.productionTime });
-    if (error) {
-      setRegisteredItems(prev => prev.filter(i => i.code !== item.code));
-      showToast("Erro ao salvar item. Tente novamente.");
-      console.error(error);
-    }
+    if (error) handleSaveError(error, () => setRegisteredItems(prev => prev.filter(i => i.code !== item.code)), "Erro ao salvar item. Tente novamente.");
   }
   async function updateItem(originalCode, newItem) {
     const prev = registeredItems.find(i => i.code === originalCode);
     setRegisteredItems(p => p.map(i => i.code === originalCode ? newItem : i));
     let error;
     if (originalCode !== newItem.code) {
-      const r1 = await supabase.from('items').delete().eq('code', originalCode);
-      if (r1.error) { error = r1.error; } else {
-        const r2 = await supabase.from('items').insert({ code: newItem.code, description: newItem.description, production_time: newItem.productionTime });
+      // Insere o novo PRIMEIRO — só deleta o antigo se o insert funcionar
+      // Ordem oposta (delete antes do insert) causava perda irreversível do item
+      const r1 = await supabase.from('items').insert({ code: newItem.code, description: newItem.description, production_time: newItem.productionTime });
+      if (r1.error) { error = r1.error; }
+      else {
+        const r2 = await supabase.from('items').delete().eq('code', originalCode);
         if (r2.error) error = r2.error;
       }
     } else {
       const r = await supabase.from('items').update({ description: newItem.description, production_time: newItem.productionTime }).eq('code', originalCode);
       if (r.error) error = r.error;
     }
-    if (error) {
-      if (prev) setRegisteredItems(p => p.map(i => i.code === newItem.code ? prev : i));
-      showToast("Erro ao atualizar item. Alteração desfeita.");
-      console.error(error);
-    }
+    if (error) handleSaveError(error, () => { if (prev) setRegisteredItems(p => p.map(i => i.code === newItem.code ? prev : i)); }, "Erro ao atualizar item. Alteração desfeita.");
   }
   async function deleteItem(code) {
     const prev = registeredItems.find(i => i.code === code);
     setRegisteredItems(p => p.filter(i => i.code !== code));
     const { error } = await supabase.from('items').delete().eq('code', code);
-    if (error) {
-      if (prev) setRegisteredItems(p => [...p, prev]);
-      showToast("Erro ao excluir item. Tente novamente.");
-      console.error(error);
-    }
+    if (error) handleSaveError(error, () => { if (prev) setRegisteredItems(p => [...p, prev]); }, "Erro ao excluir item. Tente novamente.");
   }
   async function addClient(name) {
     if (clientHistory.includes(name)) return;
@@ -1225,21 +1278,20 @@ export default function App() {
     const prev = calendarSettings;
     setCalendarSettings(newSettings);
     const { error } = await supabase.from('settings').upsert({ id: 1, calendar_settings: newSettings, day_overrides: dayOverridesRef.current });
-    if (error) {
-      setCalendarSettings(prev);
-      showToast("Erro ao salvar configurações de calendário.");
-      console.error(error);
-    }
+    if (error) handleSaveError(error, () => setCalendarSettings(prev), "Erro ao salvar configurações de calendário.");
   }
   async function saveDayOverrides(newOverrides) {
     const prev = dayOverrides;
     setDayOverrides(newOverrides);
     const { error } = await supabase.from('settings').upsert({ id: 1, calendar_settings: calendarSettingsRef.current, day_overrides: newOverrides });
-    if (error) {
-      setDayOverrides(prev);
-      showToast("Erro ao salvar exceções do calendário.");
-      console.error(error);
-    }
+    if (error) handleSaveError(error, () => setDayOverrides(prev), "Erro ao salvar exceções do calendário.");
+  }
+
+  // Helper: trata erros de save respeitando modo offline
+  function handleSaveError(error, rollback, msg) {
+    if (!offlineModeRef.current) { rollback(); showToast(msg); }
+    else { showToast("Modo offline — alteração salva localmente.", "warning"); }
+    console.error(error);
   }
 
   function handleLogin(user) { setCurrentUser(user); setActivePage("demand"); }
@@ -1262,8 +1314,11 @@ export default function App() {
     return (
       <div style={{ width: "100vw", height: "100vh", display: "flex", alignItems: "center", justifyContent: "center", background: C.dark, flexDirection: "column", gap: 20 }}>
         <div style={{ fontSize: 32, fontWeight: 900, color: C.red, fontFamily: "'Barlow Condensed', sans-serif" }}>BVN PCP</div>
-        <div style={{ fontSize: 15, color: C.danger, fontFamily: "'Barlow', sans-serif", fontWeight: 600 }}>Erro ao conectar com o banco de dados.</div>
-        <div style={{ fontSize: 13, color: C.textMuted, fontFamily: "'Barlow', sans-serif" }}>Verifique sua conexão e tente novamente.</div>
+        <div style={{ fontSize: 15, color: C.danger, fontFamily: "'Barlow', sans-serif", fontWeight: 600 }}>Não foi possível conectar ao banco de dados.</div>
+        <div style={{ maxWidth: 420, textAlign: "center", fontSize: 13, color: C.textMuted, fontFamily: "'Barlow', sans-serif", lineHeight: 1.7 }}>
+          O Supabase (free tier) pausa projetos após 7 dias sem acesso.<br/>
+          Acesse <strong style={{ color: C.text }}>supabase.com</strong>, faça login e restaure o projeto para recuperar os dados.
+        </div>
         <button onClick={loadData} style={{ padding: "12px 28px", borderRadius: 8, border: "none", background: C.red, color: "#fff", cursor: "pointer", fontSize: 15, fontWeight: 800, fontFamily: "'Barlow Condensed', sans-serif", letterSpacing: "0.05em" }}>
           Tentar Novamente
         </button>
@@ -1274,7 +1329,13 @@ export default function App() {
   return (
     <>
       <Toast toasts={toasts} />
-      <div style={{ display: "flex", height: "100vh", background: C.dark, fontFamily: F, overflow: "hidden" }}>
+      {offlineMode && (
+        <div style={{ position: "fixed", top: 0, left: 0, right: 0, zIndex: 2000, background: C.yellow, color: C.dark, padding: "7px 20px", fontSize: 12, fontWeight: 700, fontFamily: FH, letterSpacing: "0.04em", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <span>⚠ MODO OFFLINE — Supabase indisponível. Dados carregados do cache local. Todas as alterações são salvas localmente.</span>
+          <button onClick={loadData} style={{ padding: "4px 14px", borderRadius: 4, border: "none", background: C.dark, color: C.yellow, cursor: "pointer", fontFamily: FH, fontSize: 12, fontWeight: 700, letterSpacing: "0.04em" }}>↺ Reconectar</button>
+        </div>
+      )}
+      <div style={{ display: "flex", height: "100vh", background: C.dark, fontFamily: F, overflow: "hidden", paddingTop: offlineMode ? 34 : 0 }}>
         <Sidebar activePage={activePage} setActivePage={setActivePage} currentUser={currentUser} onLogout={handleLogout} />
         <div style={{ flex: 1, overflow: "auto" }}>
           {activePage === "demand" && <DemandPage orders={orders} addOrder={addOrder} updateOrder={updateOrder} registeredItems={registeredItems} clientHistory={clientHistory} addClient={addClient} editingOrderId={editingOrderId} setEditingOrderId={setEditingOrderId} setActivePage={setActivePage} />}

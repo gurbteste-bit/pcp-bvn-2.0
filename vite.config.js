@@ -25,6 +25,9 @@ export default defineConfig({
     }),
     VitePWA({
       registerType: 'autoUpdate',
+      workbox: {
+        cleanupOutdatedCaches: true,
+      },
       includeAssets: [
         'favicon.svg',
         'apple-touch-icon.png',

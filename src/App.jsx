@@ -1100,6 +1100,7 @@ export default function App() {
   const [loadError, setLoadError] = useState(false);
   const [toasts, setToasts] = useState([]);
   const [offlineMode, setOfflineMode] = useState(false);
+  const [syncing, setSyncing] = useState(false);
 
   const calendarSettingsRef = useRef(calendarSettings);
   const dayOverridesRef = useRef(dayOverrides);
@@ -1176,6 +1177,31 @@ export default function App() {
   async function loadData() {
     setLoading(true);
     setLoadError(false);
+
+    // ── PASSO 1: carrega localStorage imediatamente ──────────────────────────
+    // O app fica disponível na hora, mesmo sem internet ou com Supabase pausado.
+    const cached = {
+      orders:   LS.get(LSK.orders,   null),
+      items:    LS.get(LSK.items,    null),
+      clients:  LS.get(LSK.clients,  []),
+      cal:      LS.get(LSK.cal,      null),
+      overrides:LS.get(LSK.overrides,{}),
+      sync:     LS.get(LSK.sync,     null),
+    };
+    const hasCache = cached.orders !== null && cached.items !== null;
+
+    if (hasCache) {
+      setOrders(cached.orders);
+      setRegisteredItems(cached.items);
+      setClientHistory(cached.clients);
+      if (cached.cal) setCalendarSettings(cached.cal);
+      setDayOverrides(cached.overrides);
+      syncedRef.current = true;
+      setLoading(false); // app visível imediatamente
+    }
+
+    // ── PASSO 2: sincroniza com Supabase em segundo plano ────────────────────
+    setSyncing(true);
     try {
       const [itemsRes, ordersRes, clientsRes, settingsRes] = await Promise.all([
         supabase.from('items').select('*'),
@@ -1185,48 +1211,36 @@ export default function App() {
       ]);
       if (itemsRes.error) throw itemsRes.error;
       if (ordersRes.error) throw ordersRes.error;
-      // Itens: se Supabase retornar array vazio mas localStorage tiver dados,
-      // usa cache local e avisa — evita apagar o catálogo por falha temporária
+
       const newItems = itemsRes.data?.map(mapItem) ?? [];
-      const cachedItems = LS.get(LSK.items, []);
       if (newItems.length > 0) {
         setRegisteredItems(newItems);
-      } else if (cachedItems.length > 0) {
-        setRegisteredItems(cachedItems);
+      } else if ((cached.items || []).length > 0) {
+        // Supabase retornou vazio mas cache local tem dados — mantém o cache
         showToast("Catálogo de itens vazio no servidor — cache local restaurado.", "warning");
       }
-
       if (ordersRes.data) setOrders(ordersRes.data.map(mapOrder));
       if (clientsRes.data) setClientHistory(clientsRes.data.map(c => c.name));
-      if (settingsRes.data) { setCalendarSettings(settingsRes.data.calendar_settings); setDayOverrides(settingsRes.data.day_overrides || {}); }
-      syncedRef.current = true; // ativa o espelho localStorage
+      if (settingsRes.data) {
+        setCalendarSettings(settingsRes.data.calendar_settings);
+        setDayOverrides(settingsRes.data.day_overrides || {});
+      }
+      syncedRef.current = true;
       setOfflineMode(false);
+      setLoading(false);
       LS.set(LSK.sync, new Date().toISOString());
     } catch (e) {
-      console.error("Erro ao carregar dados do Supabase:", e);
-      // Tenta carregar do cache local (localStorage)
-      const cached = {
-        orders:   LS.get(LSK.orders,   []),
-        items:    LS.get(LSK.items,    []),
-        clients:  LS.get(LSK.clients,  []),
-        cal:      LS.get(LSK.cal,      null),
-        overrides:LS.get(LSK.overrides,{}),
-        sync:     LS.get(LSK.sync,     null),
-      };
-      if (cached.orders.length || cached.items.length) {
-        setOrders(cached.orders);
-        setRegisteredItems(cached.items);
-        setClientHistory(cached.clients);
-        if (cached.cal) setCalendarSettings(cached.cal);
-        setDayOverrides(cached.overrides);
-        syncedRef.current = true;
+      console.error("Supabase indisponível:", e);
+      if (hasCache) {
+        // Dados já estão visíveis do cache — apenas sinaliza modo offline
         setOfflineMode(true);
-        console.info("Dados carregados do cache local. Último sync:", cached.sync);
       } else {
+        // Primeiro acesso sem cache e sem Supabase — sem dados possíveis
         setLoadError(true);
+        setLoading(false);
       }
     } finally {
-      setLoading(false);
+      setSyncing(false);
     }
   }
 
@@ -1416,9 +1430,15 @@ export default function App() {
   return (
     <>
       <Toast toasts={toasts} />
+      {syncing && !offlineMode && (
+        <div style={{ position: "fixed", top: 0, left: 0, right: 0, zIndex: 2000, background: C.darkCard, color: C.textMuted, padding: "5px 20px", fontSize: 11, fontWeight: 700, fontFamily: FH, letterSpacing: "0.04em", display: "flex", alignItems: "center", gap: 8, borderBottom: `1px solid ${C.border}` }}>
+          <span style={{ display: "inline-block", width: 8, height: 8, borderRadius: "50%", background: C.green, animation: "pulse 1.2s ease-in-out infinite" }} />
+          Sincronizando com servidor...
+        </div>
+      )}
       {offlineMode && (
         <div style={{ position: "fixed", top: 0, left: 0, right: 0, zIndex: 2000, background: C.yellow, color: C.dark, padding: "7px 20px", fontSize: 12, fontWeight: 700, fontFamily: FH, letterSpacing: "0.04em", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-          <span>⚠ MODO OFFLINE — Supabase indisponível. Dados carregados do cache local. Todas as alterações são salvas localmente.</span>
+          <span>⚠ MODO OFFLINE — Supabase pausado. Exibindo dados salvos localmente. Suas alterações ficam guardadas aqui.</span>
           <button onClick={loadData} style={{ padding: "4px 14px", borderRadius: 4, border: "none", background: C.dark, color: C.yellow, cursor: "pointer", fontFamily: FH, fontSize: 12, fontWeight: 700, letterSpacing: "0.04em" }}>↺ Reconectar</button>
         </div>
       )}

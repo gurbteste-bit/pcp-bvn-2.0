@@ -261,7 +261,7 @@ function LoginPage({ users, onLogin }) {
             </div>
           </div>
           <div style={{ textAlign: "center", marginTop: 12, fontSize: 10, color: C.textDim, fontFamily: F }}>
-            v1.1.0
+            v1.2.0
           </div>
         </div>
       </div>

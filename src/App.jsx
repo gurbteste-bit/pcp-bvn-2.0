@@ -21,6 +21,8 @@ const C = {
   textDim: "#66667A",
   white: "#FFFFFF",
   steel: "#A8A8B8",
+  blue: "#2563EB",
+  blueDim: "rgba(37,99,235,0.12)",
   green: "#22C55E",
   greenDim: "rgba(34,197,94,0.12)",
   yellow: "#EAB308",
@@ -58,18 +60,27 @@ const initialOrders = [
 
 const defaultCalSettings = { segunda: 8, terca: 8, quarta: 8, quinta: 8, sexta: 8, sabado: 0, saturdayEnabled: false };
 
-const defaultUsers = [
-  { username: "admin", password: "admin123", name: "Administrador", role: "gestor" },
-  { username: "gestor", password: "gestor123", name: "Carlos Silva", role: "gestor" },
-  { username: "operador", password: "operador123", name: "João Santos", role: "operador" },
-  { username: "operador2", password: "operador123", name: "Maria Oliveira", role: "operador" },
-];
+const defaultUsers = [];
+
+const ROLE_LABELS = { gestor: "Gestor", montador: "Montador", vendedor: "Vendedor" };
+const ROLE_COLORS = { gestor: C.red, montador: C.steel, vendedor: C.yellow };
 
 // ============================================================
 // UTILITIES
 // ============================================================
 function fmtMin(m) { const h = Math.floor(m / 60); const mm = m % 60; if (h === 0) return `${mm}min`; if (mm === 0) return `${h}h`; return `${h}h ${mm}min`; }
-function fmtDate(s) { if (!s) return ""; const [y, m, d] = s.split("-"); return `${d}/${m}`; }
+function fmtSec(s) { if (!s) return "0s"; const h = Math.floor(s / 3600); const m = Math.floor((s % 3600) / 60); const sec = s % 60; if (h === 0 && m === 0) return `${sec}s`; if (h === 0) return sec === 0 ? `${m}m` : `${m}m${sec}s`; if (m === 0 && sec === 0) return `${h}h`; if (sec === 0) return `${h}h${m}m`; return `${h}h${m}m${sec}s`; }
+// Aceita "1h23m45s", "15m30s", "45s" ou um número puro (segundos, para compatibilidade)
+function parseTimeStr(str) {
+  if (str === null || str === undefined) return null;
+  const s = String(str).trim().toLowerCase().replace(/\s/g, "");
+  if (!s) return null;
+  if (/^\d+$/.test(s)) return parseInt(s, 10);
+  const m = s.match(/^(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$/);
+  if (!m || (!m[1] && !m[2] && !m[3])) return null;
+  return parseInt(m[1] || "0", 10) * 3600 + parseInt(m[2] || "0", 10) * 60 + parseInt(m[3] || "0", 10);
+}
+function fmtDate(s) { if (!s) return ""; const [, m, d] = s.split("-"); return `${d}/${m}`; }
 function fmtDateFull(s) { if (!s) return ""; const [y, m, d] = s.split("-"); return `${d}/${m}/${y}`; }
 function getDayName(s) { const d = new Date(s + "T12:00:00"); return ["Domingo", "Segunda", "Terça", "Quarta", "Quinta", "Sexta", "Sábado"][d.getDay()]; }
 function getDayKey(s) { const d = new Date(s + "T12:00:00"); return ["domingo", "segunda", "terca", "quarta", "quinta", "sexta", "sabado"][d.getDay()]; }
@@ -133,6 +144,23 @@ function Btn({ children, onClick, variant = "primary", disabled, style: s }) {
   if (variant === "ghost") return <button onClick={onClick} disabled={disabled} style={{ ...base, background: C.darkInput, color: C.textMuted, border: `1px solid ${C.border}` }}>{children}</button>;
   if (variant === "success") return <button onClick={onClick} disabled={disabled} style={{ ...base, background: C.green, color: "#fff" }}>{children}</button>;
   return <button onClick={onClick} disabled={disabled} style={base}>{children}</button>;
+}
+
+// ============================================================
+// SUGGESTION DROPDOWN — extracted to module level to prevent remount on each keystroke
+// ============================================================
+function SuggestionDropdown({ items, onSelect, renderLabel }) {
+  if (!items.length) return null;
+  return (
+    <div style={{ position: "absolute", top: "100%", left: 0, right: 0, zIndex: 10, background: C.darkCard, border: `1px solid ${C.border}`, borderRadius: 6, marginTop: 4, maxHeight: 150, overflow: "auto", boxShadow: "0 8px 24px rgba(0,0,0,0.4)" }}>
+      {items.map((item, i) => (
+        <div key={i} onClick={() => onSelect(item)} style={{ padding: "10px 14px", cursor: "pointer", color: C.text, fontSize: 13, fontFamily: F, borderBottom: `1px solid ${C.border}` }}
+          onMouseEnter={e => e.target.style.background = C.darkCardHover} onMouseLeave={e => e.target.style.background = "transparent"}>
+          {renderLabel(item)}
+        </div>
+      ))}
+    </div>
+  );
 }
 
 // ============================================================
@@ -226,12 +254,14 @@ function LoginPage({ users, onLogin }) {
             border: `1px solid ${C.border}`,
           }}>
             <div style={{ fontSize: 11, color: C.textDim, fontFamily: FH, textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 10, fontWeight: 700 }}>
-              Usuários de teste
+              Acesso
             </div>
             <div style={{ fontSize: 12, color: C.textMuted, fontFamily: F, lineHeight: 1.8 }}>
-              <span style={{ color: C.red, fontWeight: 700 }}>Gestor:</span> gestor / gestor123<br />
-              <span style={{ color: C.steel, fontWeight: 700 }}>Operador:</span> operador / operador123
+              Use o usuário e senha fornecidos pelo gestor.
             </div>
+          </div>
+          <div style={{ textAlign: "center", marginTop: 12, fontSize: 10, color: C.textDim, fontFamily: F }}>
+            v1.1.0
           </div>
         </div>
       </div>
@@ -244,12 +274,14 @@ function LoginPage({ users, onLogin }) {
 // ============================================================
 function Sidebar({ activePage, setActivePage, currentUser, onLogout }) {
   const allPages = [
-    { id: "demand", icon: "📋", label: "Demanda de Produção", roles: ["gestor", "operador"] },
-    { id: "calendar", icon: "📅", label: "Calendário", roles: ["gestor", "operador"] },
-    { id: "open", icon: "🔄", label: "Demandas em Aberto", roles: ["gestor", "operador"] },
-    { id: "items", icon: "📦", label: "Cadastro de Itens", roles: ["gestor", "operador"] },
+    { id: "demand", icon: "📋", label: "Demanda de Produção", roles: ["gestor", "montador", "vendedor"] },
+    { id: "calendar", icon: "📅", label: "Calendário", roles: ["gestor", "montador", "vendedor"] },
+    { id: "open", icon: "🔄", label: "Demandas em Aberto", roles: ["gestor", "montador", "vendedor"] },
+    { id: "logistics", icon: "🚚", label: "Logística", roles: ["gestor", "montador"] },
+    { id: "items", icon: "📦", label: "Cadastro de Itens", roles: ["gestor", "montador"] },
     { id: "reports", icon: "📊", label: "Relatórios", roles: ["gestor"] },
     { id: "export", icon: "📤", label: "Exportação", roles: ["gestor"] },
+    { id: "users", icon: "👤", label: "Usuários", roles: ["gestor"] },
   ];
 
   const pages = allPages.filter(p => p.roles.includes(currentUser.role));
@@ -305,8 +337,8 @@ function Sidebar({ activePage, setActivePage, currentUser, onLogout }) {
           <div style={{ fontSize: 13, fontWeight: 700, color: C.text, fontFamily: F }}>{currentUser.name}</div>
           <div style={{
             fontSize: 10, fontWeight: 700, fontFamily: FH, letterSpacing: "0.08em", textTransform: "uppercase",
-            color: currentUser.role === "gestor" ? C.red : C.steel, marginTop: 2,
-          }}>{currentUser.role}</div>
+            color: ROLE_COLORS[currentUser.role] || C.steel, marginTop: 2,
+          }}>{ROLE_LABELS[currentUser.role] || currentUser.role}</div>
         </div>
         <button onClick={onLogout} title="Sair" style={{
           width: 34, height: 34, borderRadius: 6, border: `1px solid ${C.border}`,
@@ -321,7 +353,7 @@ function Sidebar({ activePage, setActivePage, currentUser, onLogout }) {
 // ============================================================
 // PAGE 1: DEMANDA DE PRODUÇÃO
 // ============================================================
-function DemandPage({ orders, addOrder, updateOrder, registeredItems, clientHistory, addClient, editingOrderId, setEditingOrderId, setActivePage }) {
+function DemandPage({ orders, addOrder, updateOrder, registeredItems, clientHistory, addClient, editingOrderId, setEditingOrderId, setActivePage, calendarSettings, dayOverrides }) {
   const isEditing = editingOrderId !== null;
   const editingOrder = isEditing ? orders.find(o => o.id === editingOrderId) : null;
   const [client, setClient] = useState(editingOrder?.client || "");
@@ -336,13 +368,84 @@ function DemandPage({ orders, addOrder, updateOrder, registeredItems, clientHist
   const [showClientSugg, setShowClientSugg] = useState(false);
   const [showCodeSugg, setShowCodeSugg] = useState(false);
   const [confirm, setConfirm] = useState(null);
+  const [distMode, setDistMode] = useState(editingOrder?.productionDays?.length > 0 ? "personalizado" : "equal");
+  const [productionDays, setProductionDays] = useState(editingOrder?.productionDays?.length ? [...editingOrder.productionDays] : []);
+
+  const totalItems = demandItems.length;
+  const totalUnits = demandItems.reduce((s, i) => s + i.quantity, 0);
+  const totalProdTime = demandItems.reduce((s, i) => s + i.productionTime, 0);
 
   useEffect(() => {
-    if (editingOrder) { setClient(editingOrder.client); setOrderNumber(editingOrder.orderNumber); setDeliveryDate(editingOrder.deliveryDate); setProdStart(editingOrder.productionStart); setProdEnd(editingOrder.productionEnd); setDemandItems([...editingOrder.items]); setObservations(editingOrder.observations); }
+    if (editingOrder) {
+      setClient(editingOrder.client); setOrderNumber(editingOrder.orderNumber); setDeliveryDate(editingOrder.deliveryDate);
+      setProdStart(editingOrder.productionStart); setProdEnd(editingOrder.productionEnd);
+      setDemandItems([...editingOrder.items]); setObservations(editingOrder.observations);
+      const pd = editingOrder.productionDays || [];
+      setProductionDays(pd.length ? [...pd] : []);
+      setDistMode(pd.length ? "personalizado" : "equal");
+    }
   }, [editingOrderId]);
 
   const filteredClients = clientHistory.filter(c => c.toLowerCase().includes(client.toLowerCase()) && c !== client);
   const filteredCodes = registeredItems.filter(i => i.code.toLowerCase().includes(itemCode.toLowerCase()) && i.code !== itemCode);
+
+  // ── Distribuição da produção entre dias ─────────────────────────
+  function getDayHours(ds) { if (dayOverrides[ds] !== undefined) return dayOverrides[ds]; return calendarSettings[getDayKey(ds)] ?? 8; }
+  function getWorkDaysBetween(start, end) {
+    if (!start || !end || end < start) return [];
+    const days = []; let d = start; let guard = 0;
+    while (d <= end && guard < 400) { if (getDayHours(d) > 0) days.push(d); d = addDays(d, 1); guard++; }
+    return days;
+  }
+  function getOtherOrdersSecondsForDay(ds) {
+    return orders.reduce((sum, o) => {
+      if (isEditing && o.id === editingOrderId) return sum;
+      let secs = 0;
+      if (o.productionDays && o.productionDays.length > 0) { const pd = o.productionDays.find(p => p.date === ds); secs = pd ? pd.minutes : 0; }
+      else if (o.productionStart === ds) { secs = o.items.reduce((s, i) => s + i.productionTime, 0); }
+      return sum + secs;
+    }, 0);
+  }
+
+  useEffect(() => {
+    if (distMode === "personalizado") return;
+    if (!prodStart || totalProdTime <= 0) { setProductionDays([]); return; }
+    if (distMode === "equal") {
+      const end = prodEnd && prodEnd >= prodStart ? prodEnd : prodStart;
+      let days = getWorkDaysBetween(prodStart, end);
+      if (days.length === 0) days = [prodStart];
+      const per = Math.floor(totalProdTime / days.length);
+      const rem = totalProdTime - per * days.length;
+      setProductionDays(days.map((d, i) => ({ date: d, minutes: per + (i === days.length - 1 ? rem : 0) })));
+    } else if (distMode === "maximo") {
+      const dist = []; let remaining = totalProdTime, d = prodStart, guard = 0;
+      while (remaining > 0 && guard < 400) {
+        const hours = getDayHours(d);
+        if (hours > 0) {
+          const cap = Math.max(0, hours * 3600 - getOtherOrdersSecondsForDay(d));
+          const take = Math.min(remaining, cap);
+          if (take > 0) { dist.push({ date: d, minutes: take }); remaining -= take; }
+        }
+        d = addDays(d, 1); guard++;
+      }
+      setProductionDays(dist);
+      if (dist.length > 0) { const lastDay = dist[dist.length - 1].date; if (lastDay !== prodEnd) setProdEnd(lastDay); }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [distMode, prodStart, prodEnd, totalProdTime]);
+
+  function addCustomDay() {
+    const lastDate = productionDays.length ? productionDays[productionDays.length - 1].date : (prodStart || getToday());
+    const nextDate = productionDays.length ? addDays(lastDate, 1) : (prodStart || getToday());
+    setProductionDays([...productionDays, { date: nextDate, minutes: 0 }]);
+  }
+  function removeCustomDay(idx) { setProductionDays(productionDays.filter((_, i) => i !== idx)); }
+  function updateCustomDayDate(idx, date) { setProductionDays(productionDays.map((pd, i) => i === idx ? { ...pd, date } : pd)); }
+  function updateCustomDayTime(idx, raw) {
+    const secs = parseTimeStr(raw);
+    setProductionDays(productionDays.map((pd, i) => i === idx ? { ...pd, minutes: secs !== null ? secs : pd.minutes, _raw: raw } : pd));
+  }
+  const distTotal = productionDays.reduce((s, pd) => s + (pd.minutes || 0), 0);
 
   function handleProdStartChange(val) {
     if (deliveryDate && val > deliveryDate) {
@@ -370,34 +473,23 @@ function DemandPage({ orders, addOrder, updateOrder, registeredItems, clientHist
   function confirmOrder() {
     if (!client || !orderNumber || !deliveryDate) return alert("Preencha cliente, pedido e previsão de entrega.");
     if (demandItems.length === 0) return alert("Adicione ao menos um item.");
+    if (!prodStart) return alert("Selecione o início de produção.");
+    if (productionDays.length === 0) return alert("Configure a distribuição da produção entre os dias.");
+    const finalDays = productionDays.map(({ date, minutes }) => ({ date, minutes })).sort((a, b) => a.date.localeCompare(b.date));
+    const finalDistTotal = finalDays.reduce((s, pd) => s + pd.minutes, 0);
+    const mismatchWarning = finalDistTotal !== totalProdTime ? `\n\nAtenção: o total distribuído (${fmtSec(finalDistTotal)}) é diferente do tempo total dos itens (${fmtSec(totalProdTime)}).` : "";
+    const finalStart = finalDays[0].date;
+    const finalEnd = finalDays[finalDays.length - 1].date;
     setConfirm({
-      message: "Deseja concluir o pedido?",
+      message: "Deseja concluir o pedido?" + mismatchWarning,
       onYes: () => {
         addClient(client);
         const cm = {}; demandItems.forEach(i => cm[i.code] = false);
-        if (isEditing) { updateOrder(editingOrderId, { client, orderNumber, deliveryDate, productionStart: prodStart, productionEnd: prodEnd, items: demandItems, observations, itemsCompleted: { ...editingOrder.itemsCompleted, ...cm } }); setEditingOrderId(null); }
-        else { addOrder({ id: String(Date.now()), client, orderNumber, deliveryDate, productionStart: prodStart, productionEnd: prodEnd, items: demandItems, observations, status: "scheduled", itemsCompleted: cm }); }
-        setClient(""); setOrderNumber(""); setDeliveryDate(""); setProdStart(""); setProdEnd(""); setDemandItems([]); setObservations(""); setConfirm(null);
+        if (isEditing) { updateOrder(editingOrderId, { client, orderNumber, deliveryDate, productionStart: finalStart, productionEnd: finalEnd, productionDays: finalDays, items: demandItems, observations, itemsCompleted: { ...editingOrder.itemsCompleted, ...cm } }); setEditingOrderId(null); }
+        else { addOrder({ id: String(Date.now()), client, orderNumber, deliveryDate, productionStart: finalStart, productionEnd: finalEnd, productionDays: finalDays, items: demandItems, observations, status: "scheduled", itemsCompleted: cm }); }
+        setClient(""); setOrderNumber(""); setDeliveryDate(""); setProdStart(""); setProdEnd(""); setDemandItems([]); setObservations(""); setProductionDays([]); setDistMode("equal"); setConfirm(null);
       }, onNo: () => setConfirm(null),
     });
-  }
-
-  const totalItems = demandItems.length;
-  const totalUnits = demandItems.reduce((s, i) => s + i.quantity, 0);
-  const totalProdTime = demandItems.reduce((s, i) => s + i.productionTime, 0);
-
-  function SuggestionDropdown({ items, onSelect, renderLabel }) {
-    if (!items.length) return null;
-    return (
-      <div style={{ position: "absolute", top: "100%", left: 0, right: 0, zIndex: 10, background: C.darkCard, border: `1px solid ${C.border}`, borderRadius: 6, marginTop: 4, maxHeight: 150, overflow: "auto", boxShadow: "0 8px 24px rgba(0,0,0,0.4)" }}>
-        {items.map((item, i) => (
-          <div key={i} onClick={() => onSelect(item)} style={{ padding: "10px 14px", cursor: "pointer", color: C.text, fontSize: 13, fontFamily: F, borderBottom: `1px solid ${C.border}` }}
-            onMouseEnter={e => e.target.style.background = C.darkCardHover} onMouseLeave={e => e.target.style.background = "transparent"}>
-            {renderLabel(item)}
-          </div>
-        ))}
-      </div>
-    );
   }
 
   return (
@@ -407,7 +499,7 @@ function DemandPage({ orders, addOrder, updateOrder, registeredItems, clientHist
         <h1 style={{ margin: 0, fontSize: 26, fontWeight: 800, color: C.text, fontFamily: FH, letterSpacing: "0.02em" }}>
           {isEditing ? "Editar Demanda" : "Demanda de Produção"}
         </h1>
-        {isEditing && <Btn variant="ghost" onClick={() => { setEditingOrderId(null); setClient(""); setOrderNumber(""); setDeliveryDate(""); setProdStart(""); setProdEnd(""); setDemandItems([]); setObservations(""); }}>← Cancelar</Btn>}
+        {isEditing && <Btn variant="ghost" onClick={() => { setEditingOrderId(null); setClient(""); setOrderNumber(""); setDeliveryDate(""); setProdStart(""); setProdEnd(""); setDemandItems([]); setObservations(""); setProductionDays([]); setDistMode("equal"); }}>← Cancelar</Btn>}
       </div>
 
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginBottom: 20 }}>
@@ -442,7 +534,7 @@ function DemandPage({ orders, addOrder, updateOrder, registeredItems, clientHist
           <div style={{ display: "flex", gap: 16, fontSize: 12, fontFamily: F }}>
             <span style={{ color: C.textMuted }}>Itens: <span style={{ color: C.red, fontWeight: 700 }}>{totalItems}</span></span>
             <span style={{ color: C.textMuted }}>Unidades: <span style={{ color: C.red, fontWeight: 700 }}>{totalUnits}</span></span>
-            <span style={{ color: C.textMuted }}>Tempo: <span style={{ color: C.red, fontWeight: 700 }}>{fmtMin(totalProdTime)}</span></span>
+            <span style={{ color: C.textMuted }}>Tempo: <span style={{ color: C.red, fontWeight: 700 }}>{fmtSec(totalProdTime)}</span></span>
           </div>
         </div>
         <div style={{ display: "grid", gridTemplateColumns: "2fr 3fr 1fr 2fr 36px", padding: "8px 20px", borderBottom: `1px solid ${C.border}`, fontSize: 10, fontWeight: 700, color: C.textDim, fontFamily: FH, textTransform: "uppercase", letterSpacing: "0.08em" }}>
@@ -455,11 +547,65 @@ function DemandPage({ orders, addOrder, updateOrder, registeredItems, clientHist
               <span style={{ fontWeight: 700, color: C.red }}>{item.code}</span>
               <span>{item.description}</span>
               <span>{item.quantity}</span>
-              <span>{fmtMin(item.productionTime)}</span>
+              <span>{fmtSec(item.productionTime)}</span>
               <button onClick={() => removeItem(item.code)} style={{ background: "none", border: "none", color: C.danger, cursor: "pointer", fontSize: 14, padding: 0 }}>✕</button>
             </div>
           ))}
         </div>
+      </div>
+
+      {/* Distribuição da Produção */}
+      <div style={{ background: C.darkCard, borderRadius: 10, border: `1px solid ${C.border}`, padding: 20, marginBottom: 20 }}>
+        <div style={{ fontSize: 13, fontWeight: 700, color: C.text, marginBottom: 14, fontFamily: FH, letterSpacing: "0.04em", textTransform: "uppercase" }}>Distribuição da Produção</div>
+        {(!prodStart || totalProdTime <= 0) ? (
+          <div style={{ color: C.textDim, fontSize: 13, fontFamily: F }}>Escolha o início de produção e adicione itens para configurar a distribuição por dia.</div>
+        ) : (
+          <>
+            <div style={{ display: "flex", gap: 8, marginBottom: 16, flexWrap: "wrap" }}>
+              {[["equal", "Dividir Igualmente"], ["maximo", "Máximo por Dia"], ["personalizado", "Personalizado"]].map(([id, label]) => (
+                <button key={id} onClick={() => setDistMode(id)} style={{ padding: "9px 16px", borderRadius: 6, cursor: "pointer", border: distMode === id ? `2px solid ${C.red}` : `1px solid ${C.border}`, background: distMode === id ? C.redDim : C.darkInput, color: distMode === id ? C.red : C.textMuted, fontFamily: FH, fontSize: 12, fontWeight: 700 }}>
+                  {label}
+                </button>
+              ))}
+            </div>
+
+            {distMode === "personalizado" && (
+              <div style={{ marginBottom: 10 }}>
+                <Btn variant="ghost" onClick={addCustomDay} style={{ padding: "7px 16px", fontSize: 12 }}>+ Adicionar Dia</Btn>
+              </div>
+            )}
+
+            <div style={{ display: "grid", gridTemplateColumns: distMode === "personalizado" ? "1fr 1fr 36px" : "1fr 1fr", padding: "8px 4px", fontSize: 10, fontWeight: 700, color: C.textDim, fontFamily: FH, textTransform: "uppercase", letterSpacing: "0.08em", borderBottom: `1px solid ${C.border}` }}>
+              <span>Data</span><span>Tempo</span>{distMode === "personalizado" && <span />}
+            </div>
+            <div style={{ maxHeight: 220, overflow: "auto" }}>
+              {productionDays.length === 0 ? (
+                <div style={{ padding: 16, color: C.textDim, fontSize: 12, fontFamily: F }}>Nenhum dia configurado</div>
+              ) : productionDays.map((pd, idx) => (
+                <div key={idx} style={{ display: "grid", gridTemplateColumns: distMode === "personalizado" ? "1fr 1fr 36px" : "1fr 1fr", padding: "8px 4px", borderBottom: `1px solid ${C.border}`, alignItems: "center", fontSize: 13, color: C.text, fontFamily: F, gap: 8 }}>
+                  {distMode === "personalizado" ? (
+                    <input type="date" value={pd.date} onChange={e => updateCustomDayDate(idx, e.target.value)} style={{ ...inputStyle, padding: "7px 10px" }} />
+                  ) : (
+                    <span>{getDayName(pd.date)} — {fmtDateFull(pd.date)}</span>
+                  )}
+                  {distMode === "personalizado" ? (
+                    <input value={pd._raw !== undefined ? pd._raw : fmtSec(pd.minutes)} onChange={e => updateCustomDayTime(idx, e.target.value)} placeholder="Ex: 2h30m" style={{ ...inputStyle, padding: "7px 10px" }} />
+                  ) : (
+                    <span style={{ color: C.red, fontWeight: 700 }}>{fmtSec(pd.minutes)}</span>
+                  )}
+                  {distMode === "personalizado" && (
+                    <button onClick={() => removeCustomDay(idx)} style={{ background: "none", border: "none", color: C.danger, cursor: "pointer", fontSize: 14 }}>✕</button>
+                  )}
+                </div>
+              ))}
+            </div>
+
+            <div style={{ display: "flex", justifyContent: "space-between", marginTop: 10, fontSize: 12, fontFamily: F, flexWrap: "wrap", gap: 8 }}>
+              <span style={{ color: C.textMuted }}>Total alocado: <span style={{ color: distTotal === totalProdTime ? C.green : C.orange, fontWeight: 700 }}>{fmtSec(distTotal)}</span> de {fmtSec(totalProdTime)}</span>
+              {distMode === "maximo" && prodEnd && <span style={{ color: C.textMuted }}>Fim recalculado: <span style={{ color: C.text, fontWeight: 700 }}>{fmtDateFull(prodEnd)}</span></span>}
+            </div>
+          </>
+        )}
       </div>
 
       <Field label="Observações"><textarea value={observations} onChange={e => setObservations(e.target.value)} rows={3} placeholder="Observações..." style={{ ...inputStyle, resize: "vertical" }} /></Field>
@@ -473,7 +619,7 @@ function DemandPage({ orders, addOrder, updateOrder, registeredItems, clientHist
 // ============================================================
 // PAGE 2: CALENDÁRIO DE PRODUÇÃO
 // ============================================================
-function CalendarPage({ orders, updateOrder, calendarSettings, saveCalendarSettings, dayOverrides, saveDayOverrides, setEditingOrderId, setActivePage }) {
+function CalendarPage({ orders, updateOrder, calendarSettings, saveCalendarSettings, dayOverrides, saveDayOverrides, setEditingOrderId, setActivePage, logistics }) {
   const [weekOffset, setWeekOffset] = useState(0);
   const [showSettings, setShowSettings] = useState(false);
   const [showDayConfig, setShowDayConfig] = useState(null);
@@ -490,8 +636,17 @@ function CalendarPage({ orders, updateOrder, calendarSettings, saveCalendarSetti
     return weeks;
   }
   function getHoursForDay(ds) { if (dayOverrides[ds] !== undefined) return dayOverrides[ds]; return calendarSettings[getDayKey(ds)] ?? 8; }
-  function getOrdersForDay(ds) { return orders.filter(o => o.productionStart === ds); }
-  function getOccupation(ds) { const h = getHoursForDay(ds); if (h === 0) return 0; const m = getOrdersForDay(ds).reduce((s, o) => s + o.items.reduce((ss, i) => ss + i.productionTime, 0), 0); return Math.round((m / (h * 60)) * 100); }
+  function getOrdersForDay(ds) {
+    return orders.filter(o => {
+      if (o.productionDays && o.productionDays.length > 0) return o.productionDays.some(pd => pd.date === ds);
+      return o.productionStart === ds;
+    });
+  }
+  function getOrderMinutesForDay(o, ds) {
+    if (o.productionDays && o.productionDays.length > 0) { const pd = o.productionDays.find(p => p.date === ds); return pd ? pd.minutes : 0; }
+    return o.productionStart === ds ? o.items.reduce((s, i) => s + i.productionTime, 0) : 0;
+  }
+  function getOccupation(ds) { const h = getHoursForDay(ds); if (h === 0) return 0; const m = getOrdersForDay(ds).reduce((s, o) => s + getOrderMinutesForDay(o, ds), 0); return Math.round((m / (h * 3600)) * 100); }
   function occColor(pct) { if (pct <= 60) return { bg: C.greenDim, text: C.green }; if (pct <= 75) return { bg: C.yellowDim, text: C.yellow }; if (pct <= 90) return { bg: C.orangeDim, text: C.orange }; return { bg: C.dangerDim, text: C.danger }; }
   function handleDrop(ds) { if (!dragOrder) return; updateOrder(dragOrder, { productionStart: ds }); setDragOrder(null); }
 
@@ -504,10 +659,17 @@ function CalendarPage({ orders, updateOrder, calendarSettings, saveCalendarSetti
           <h1 style={{ margin: 0, fontSize: 26, fontWeight: 800, color: C.text, fontFamily: FH, letterSpacing: "0.02em" }}>Calendário de Produção</h1>
           <button onClick={() => setShowSettings(true)} style={{ width: 34, height: 34, borderRadius: 6, border: `1px solid ${C.border}`, background: C.darkCard, color: C.textMuted, cursor: "pointer", fontSize: 17, display: "flex", alignItems: "center", justifyContent: "center" }}>⚙</button>
         </div>
-        <div style={{ display: "flex", gap: 6 }}>
-          <Btn variant="ghost" onClick={() => setWeekOffset(w => w - 4)}>◀</Btn>
-          <Btn variant="ghost" onClick={() => setWeekOffset(0)} style={{ color: C.red }}>Hoje</Btn>
-          <Btn variant="ghost" onClick={() => setWeekOffset(w => w + 4)}>▶</Btn>
+        <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
+          <div style={{ display: "flex", gap: 12, fontSize: 11, fontFamily: FH, fontWeight: 700, letterSpacing: "0.04em" }}>
+            <span style={{ display: "flex", alignItems: "center", gap: 5 }}><span style={{ width: 10, height: 10, borderRadius: 2, background: C.redDim, border: `2px solid ${C.red}` }} /><span style={{ color: C.textMuted }}>Ativo</span></span>
+            <span style={{ display: "flex", alignItems: "center", gap: 5 }}><span style={{ width: 10, height: 10, borderRadius: 2, background: C.blueDim, border: `2px solid ${C.blue}` }} /><span style={{ color: C.textMuted }}>Pronto</span></span>
+            <span style={{ display: "flex", alignItems: "center", gap: 5 }}><span style={{ width: 10, height: 10, borderRadius: 2, background: C.greenDim, border: `2px solid ${C.green}` }} /><span style={{ color: C.textMuted }}>Coletado</span></span>
+          </div>
+          <div style={{ display: "flex", gap: 6 }}>
+            <Btn variant="ghost" onClick={() => setWeekOffset(w => w - 4)}>◀</Btn>
+            <Btn variant="ghost" onClick={() => setWeekOffset(0)} style={{ color: C.red }}>Hoje</Btn>
+            <Btn variant="ghost" onClick={() => setWeekOffset(w => w + 4)}>▶</Btn>
+          </div>
         </div>
       </div>
 
@@ -531,14 +693,22 @@ function CalendarPage({ orders, updateOrder, calendarSettings, saveCalendarSetti
                     </div>
                     <button onClick={() => { setShowDayConfig(ds); setDayConfigHours(getHoursForDay(ds)); }} style={{ background: "none", border: "none", color: C.textDim, cursor: "pointer", fontSize: 13, padding: 0 }}>⋯</button>
                   </div>
-                  {getOrdersForDay(ds).map(o => (
-                    <div key={o.id} draggable onDragStart={() => setDragOrder(o.id)} onDoubleClick={() => { setEditingOrderId(o.id); setActivePage("demand"); }}
-                      style={{ padding: "5px 8px", borderRadius: 5, background: C.redDim, cursor: "grab", fontSize: 10, fontFamily: F, color: C.text, fontWeight: 600, borderLeft: `3px solid ${C.red}`, marginBottom: 3, transition: "transform 0.1s" }}
-                      onMouseEnter={e => e.currentTarget.style.transform = "scale(1.03)"} onMouseLeave={e => e.currentTarget.style.transform = "scale(1)"}>
-                      <span style={{ fontWeight: 800, color: C.red }}>{o.client}</span>
-                      <span style={{ color: C.textMuted, marginLeft: 5 }}>#{o.orderNumber}</span>
-                    </div>
-                  ))}
+                  {getOrdersForDay(ds).map(o => {
+                    const logiData = (logistics || {})[String(o.id)] || {};
+                    const isCollected = o.status === "completed" && logiData.collected;
+                    const isCompleted = o.status === "completed" && !logiData.collected;
+                    const cardBg = isCollected ? C.greenDim : isCompleted ? C.blueDim : C.redDim;
+                    const cardBorder = isCollected ? C.green : isCompleted ? C.blue : C.red;
+                    const clientColor = isCollected ? C.green : isCompleted ? C.blue : C.red;
+                    return (
+                      <div key={o.id} draggable onDragStart={() => setDragOrder(o.id)} onDoubleClick={() => { setEditingOrderId(o.id); setActivePage("demand"); }}
+                        style={{ padding: "5px 8px", borderRadius: 5, background: cardBg, cursor: "grab", fontSize: 10, fontFamily: F, color: C.text, fontWeight: 600, borderLeft: `3px solid ${cardBorder}`, marginBottom: 3, transition: "transform 0.1s" }}
+                        onMouseEnter={e => e.currentTarget.style.transform = "scale(1.03)"} onMouseLeave={e => e.currentTarget.style.transform = "scale(1)"}>
+                        <span style={{ fontWeight: 800, color: clientColor }}>{o.client}</span>
+                        <span style={{ color: C.textMuted, marginLeft: 5 }}>#{o.orderNumber}</span>
+                      </div>
+                    );
+                  })}
                 </div>
               );
             })}
@@ -577,17 +747,46 @@ function CalendarPage({ orders, updateOrder, calendarSettings, saveCalendarSetti
 }
 
 // ============================================================
+// DROP ZONE — extracted to module level to prevent remount on each drag/state change
+// ============================================================
+function DropZone({ title, zone, items, color, onDragStart, onDrop, onSelect, onEdit }) {
+  return (
+    <div onDragOver={e => { e.preventDefault(); e.currentTarget.style.borderColor = color; }} onDragLeave={e => { e.currentTarget.style.borderColor = C.border; }} onDrop={e => { e.preventDefault(); e.currentTarget.style.borderColor = C.border; onDrop(zone); }}
+      style={{ flex: 1, background: C.dark, borderRadius: 10, border: `2px dashed ${C.border}`, padding: 14, minHeight: 170, transition: "border-color 0.2s" }}>
+      <div style={{ fontSize: 12, fontWeight: 800, color, marginBottom: 10, fontFamily: FH, textTransform: "uppercase", letterSpacing: "0.06em", display: "flex", alignItems: "center", gap: 8 }}>
+        <span style={{ width: 8, height: 8, borderRadius: "50%", background: color }} />{title}
+        <span style={{ fontSize: 11, fontWeight: 500, color: C.textMuted, marginLeft: "auto" }}>{items.length}</span>
+      </div>
+      {items.map(o => (
+        <div key={o.id} draggable onDragStart={() => onDragStart(o.id)} onClick={() => zone === "executing" && onSelect(o.id)}
+          onDoubleClick={() => onEdit(o.id)}
+          style={{ padding: "10px 14px", borderRadius: 8, background: C.darkCard, border: `1px solid ${C.border}`, cursor: "grab", marginBottom: 6, transition: "transform 0.1s" }}
+          onMouseEnter={e => e.currentTarget.style.transform = "translateX(3px)"} onMouseLeave={e => e.currentTarget.style.transform = "translateX(0)"}>
+          <div style={{ fontWeight: 800, color: C.text, fontSize: 13, fontFamily: F }}>{o.client}</div>
+          <div style={{ color: C.textMuted, fontSize: 11, fontFamily: F, marginTop: 2 }}>#{o.orderNumber}</div>
+        </div>
+      ))}
+      {items.length === 0 && <div style={{ color: C.textDim, fontSize: 12, textAlign: "center", fontFamily: F, padding: 16 }}>Arraste pedidos aqui</div>}
+    </div>
+  );
+}
+
+// ============================================================
 // PAGE 3: DEMANDAS EM ABERTO
 // ============================================================
-function OpenDemandsPage({ orders, updateOrder, setEditingOrderId, setActivePage }) {
+function OpenDemandsPage({ orders, updateOrder, setEditingOrderId, setActivePage, logistics, saveLogistics }) {
   const today = getToday(); const tomorrow = getTomorrow();
   const [selectedExec, setSelectedExec] = useState(null);
   const [dragItem, setDragItem] = useState(null);
-  const [confirm, setConfirm] = useState(null);
+  const [deliverModal, setDeliverModal] = useState(null); // { orderId, hasMissing, location }
 
-  const todayOrders = orders.filter(o => o.productionStart === today && o.status !== "executing" && o.status !== "completed");
+  function isOrderForDay(o, day) {
+    if (o.productionDays && o.productionDays.length > 0) return o.productionDays.some(pd => pd.date === day);
+    return o.productionStart === day;
+  }
+  const todayOrders = orders.filter(o => isOrderForDay(o, today) && o.status !== "executing" && o.status !== "completed");
   const executingOrders = orders.filter(o => o.status === "executing");
-  const tomorrowOrders = orders.filter(o => o.productionStart === tomorrow && o.status !== "executing" && o.status !== "completed");
+  const tomorrowOrders = orders.filter(o => isOrderForDay(o, tomorrow) && o.status !== "executing" && o.status !== "completed");
 
   function moveOrder(id, target) {
     if (target === "executing") updateOrder(id, { status: "executing" });
@@ -602,51 +801,60 @@ function OpenDemandsPage({ orders, updateOrder, setEditingOrderId, setActivePage
   }
   function allDone(o) { return o.items.every(i => o.itemsCompleted[i.code]); }
   function deliverOrder(id) {
-    setConfirm({ message: "Deseja entregar esta demanda?", onYes: () => { updateOrder(id, { status: "completed" }); setSelectedExec(null); setConfirm(null); }, onNo: () => setConfirm(null) });
+    const order = orders.find(o => o.id === id);
+    const hasMissing = order && order.items.length > 0 && !order.items.every(i => order.itemsCompleted[i.code]);
+    setDeliverModal({ orderId: id, hasMissing, location: "" });
+  }
+  function confirmDeliver() {
+    if (!deliverModal || !deliverModal.location.trim()) return;
+    const { orderId, location } = deliverModal;
+    const today = getToday();
+    updateOrder(orderId, { status: "completed" });
+    const existing = (logistics || {})[String(orderId)] || {};
+    if (saveLogistics) saveLogistics({ ...(logistics || {}), [String(orderId)]: { ...existing, completionDate: today, location: location.trim() } });
+    setSelectedExec(null);
+    setDeliverModal(null);
   }
 
   const execOrder = selectedExec ? orders.find(o => o.id === selectedExec) : (executingOrders[0] || null);
   const totalProd = execOrder ? execOrder.items.reduce((s, i) => s + i.productionTime, 0) : 0;
   const doneProd = execOrder ? execOrder.items.filter(i => execOrder.itemsCompleted[i.code]).reduce((s, i) => s + i.productionTime, 0) : 0;
 
-  function DropZone({ title, zone, items, color }) {
-    return (
-      <div onDragOver={e => { e.preventDefault(); e.currentTarget.style.borderColor = color; }} onDragLeave={e => { e.currentTarget.style.borderColor = C.border; }} onDrop={e => { e.preventDefault(); e.currentTarget.style.borderColor = C.border; handleDrop(zone); }}
-        style={{ flex: 1, background: C.dark, borderRadius: 10, border: `2px dashed ${C.border}`, padding: 14, minHeight: 170, transition: "border-color 0.2s" }}>
-        <div style={{ fontSize: 12, fontWeight: 800, color, marginBottom: 10, fontFamily: FH, textTransform: "uppercase", letterSpacing: "0.06em", display: "flex", alignItems: "center", gap: 8 }}>
-          <span style={{ width: 8, height: 8, borderRadius: "50%", background: color }} />{title}
-          <span style={{ fontSize: 11, fontWeight: 500, color: C.textMuted, marginLeft: "auto" }}>{items.length}</span>
-        </div>
-        {items.map(o => (
-          <div key={o.id} draggable onDragStart={() => setDragItem(o.id)} onClick={() => zone === "executing" && setSelectedExec(o.id)}
-            onDoubleClick={() => { setEditingOrderId(o.id); setActivePage("demand"); }}
-            style={{ padding: "10px 14px", borderRadius: 8, background: C.darkCard, border: `1px solid ${C.border}`, cursor: "grab", marginBottom: 6, transition: "transform 0.1s" }}
-            onMouseEnter={e => e.currentTarget.style.transform = "translateX(3px)"} onMouseLeave={e => e.currentTarget.style.transform = "translateX(0)"}>
-            <div style={{ fontWeight: 800, color: C.text, fontSize: 13, fontFamily: F }}>{o.client}</div>
-            <div style={{ color: C.textMuted, fontSize: 11, fontFamily: F, marginTop: 2 }}>#{o.orderNumber}</div>
-          </div>
-        ))}
-        {items.length === 0 && <div style={{ color: C.textDim, fontSize: 12, textAlign: "center", fontFamily: F, padding: 16 }}>Arraste pedidos aqui</div>}
-      </div>
-    );
-  }
+  const editOrder = useCallback((id) => { setEditingOrderId(id); setActivePage("demand"); }, [setEditingOrderId, setActivePage]);
 
   return (
     <div style={{ padding: 24, height: "100vh", display: "flex", flexDirection: "column", overflow: "hidden" }}>
-      <ConfirmDialog open={!!confirm} message={confirm?.message || ""} onYes={confirm?.onYes} onNo={confirm?.onNo} />
+      <Modal open={!!deliverModal} onClose={() => setDeliverModal(null)} title="Confirmar Entrega" width={440}>
+        {deliverModal && (
+          <div>
+            {deliverModal.hasMissing && (
+              <div style={{ padding: "10px 14px", borderRadius: 6, background: C.yellowDim, color: C.yellow, fontSize: 13, fontFamily: F, marginBottom: 16, border: `1px solid ${C.yellow}30` }}>
+                ⚠ Alguns itens não foram concluídos. Eles ficarão registrados como faltantes na Logística.
+              </div>
+            )}
+            <Field label="Localização no estoque">
+              <input value={deliverModal.location} onChange={e => setDeliverModal({ ...deliverModal, location: e.target.value })} placeholder="Ex: EXP-2 E-09" style={inputStyle} autoFocus />
+            </Field>
+            <div style={{ display: "flex", gap: 12, justifyContent: "flex-end" }}>
+              <button onClick={() => setDeliverModal(null)} style={{ padding: "10px 24px", borderRadius: 6, border: `1px solid ${C.border}`, background: C.darkInput, color: C.textMuted, cursor: "pointer", fontFamily: FH, fontSize: 14, fontWeight: 600 }}>Cancelar</button>
+              <button onClick={confirmDeliver} disabled={!deliverModal.location.trim()} style={{ padding: "10px 24px", borderRadius: 6, border: "none", background: C.green, color: "#fff", cursor: deliverModal.location.trim() ? "pointer" : "not-allowed", opacity: deliverModal.location.trim() ? 1 : 0.5, fontFamily: FH, fontSize: 14, fontWeight: 700 }}>✓ Confirmar Entrega</button>
+            </div>
+          </div>
+        )}
+      </Modal>
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 18 }}>
         <h1 style={{ margin: 0, fontSize: 26, fontWeight: 800, color: C.text, fontFamily: FH, letterSpacing: "0.02em" }}>Demandas em Aberto</h1>
         <span style={{ fontSize: 13, color: C.textMuted, fontFamily: F }}>{getDayName(today)} — {fmtDateFull(today)}</span>
       </div>
       <div style={{ display: "flex", gap: 14, marginBottom: 18 }}>
-        <DropZone title="Programado Hoje" zone="today" items={todayOrders} color={C.red} />
-        <DropZone title="Em Execução" zone="executing" items={executingOrders} color={C.green} />
-        <DropZone title="Programado Amanhã" zone="tomorrow" items={tomorrowOrders} color={C.steel} />
+        <DropZone title="Programado Hoje" zone="today" items={todayOrders} color={C.red} onDragStart={setDragItem} onDrop={handleDrop} onSelect={setSelectedExec} onEdit={editOrder} />
+        <DropZone title="Em Execução" zone="executing" items={executingOrders} color={C.green} onDragStart={setDragItem} onDrop={handleDrop} onSelect={setSelectedExec} onEdit={editOrder} />
+        <DropZone title="Programado Amanhã" zone="tomorrow" items={tomorrowOrders} color={C.steel} onDragStart={setDragItem} onDrop={handleDrop} onSelect={setSelectedExec} onEdit={editOrder} />
       </div>
       {execOrder && execOrder.status === "executing" && (
         <div style={{ flex: 1, background: C.darkCard, borderRadius: 10, border: `1px solid ${C.border}`, overflow: "hidden", display: "flex", flexDirection: "column" }}>
           <div style={{ padding: "14px 24px", borderBottom: `1px solid ${C.border}`, display: "flex", gap: 20, alignItems: "center", flexWrap: "wrap" }}>
-            {[["Cliente", execOrder.client, C.text], ["Pedido", "#" + execOrder.orderNumber, C.red], ["Início", fmtDateFull(execOrder.productionStart), C.text], ["Fim", fmtDateFull(execOrder.productionEnd), C.text], ["Entrega", fmtDateFull(execOrder.deliveryDate), C.text], ["Restante", fmtMin(totalProd - doneProd), C.yellow]].map(([l, v, c]) => (
+            {[["Cliente", execOrder.client, C.text], ["Pedido", "#" + execOrder.orderNumber, C.red], ["Início", fmtDateFull(execOrder.productionStart), C.text], ["Fim", fmtDateFull(execOrder.productionEnd), C.text], ["Entrega", fmtDateFull(execOrder.deliveryDate), C.text], ["Restante", fmtSec(totalProd - doneProd), C.yellow]].map(([l, v, c]) => (
               <div key={l}><div style={{ fontSize: 10, color: C.textDim, fontFamily: FH, textTransform: "uppercase", letterSpacing: "0.08em", fontWeight: 700 }}>{l}</div><div style={{ fontSize: 14, fontWeight: 800, color: c, fontFamily: FH }}>{v}</div></div>
             ))}
           </div>
@@ -667,9 +875,9 @@ function OpenDemandsPage({ orders, updateOrder, setEditingOrderId, setActivePage
             ))}
           </div>
           <div style={{ padding: "14px 24px", borderTop: `1px solid ${C.border}` }}>
-            <Btn variant={allDone(execOrder) ? "success" : undefined} disabled={!allDone(execOrder)} onClick={() => allDone(execOrder) && deliverOrder(execOrder.id)}
-              style={{ width: "100%", padding: 14, fontSize: 15, textTransform: "uppercase", letterSpacing: "0.06em", background: allDone(execOrder) ? C.green : C.darkInput, color: allDone(execOrder) ? "#fff" : C.textDim }}>
-              Entregar Demanda
+            <Btn onClick={() => deliverOrder(execOrder.id)}
+              style={{ width: "100%", padding: 14, fontSize: 15, textTransform: "uppercase", letterSpacing: "0.06em", background: allDone(execOrder) ? C.green : C.yellow, color: "#fff" }}>
+              {allDone(execOrder) ? "Entregar Demanda" : "⚠ Entregar com Faltantes"}
             </Btn>
           </div>
         </div>
@@ -689,13 +897,13 @@ function ItemsPage({ registeredItems, addItem, updateItem, deleteItem }) {
 
   function saveItem() {
     if (!code || !desc || !time) return alert("Preencha todos os campos.");
-    const mins = parseInt(time); if (!mins || mins < 1) return alert("Tempo deve ser positivo.");
+    const secs = parseTimeStr(time); if (!secs || secs < 1) return alert("Tempo inválido. Use um formato como 15m30s ou 1h23m45s.");
     if (editCode !== null) {
-      updateItem(editCode, { code: code.toUpperCase(), description: desc, productionTime: mins });
+      updateItem(editCode, { code: code.toUpperCase(), description: desc, productionTime: secs });
       setEditCode(null);
     } else {
       if (registeredItems.find(i => i.code === code.toUpperCase())) return alert("Código já cadastrado.");
-      addItem({ code: code.toUpperCase(), description: desc, productionTime: mins });
+      addItem({ code: code.toUpperCase(), description: desc, productionTime: secs });
     }
     setCode(""); setDesc(""); setTime("");
   }
@@ -716,7 +924,7 @@ function ItemsPage({ registeredItems, addItem, updateItem, deleteItem }) {
         <div style={{ display: "grid", gridTemplateColumns: "1fr 2fr 1fr", gap: 14, marginBottom: 14 }}>
           <Field label="Código"><input value={code} onChange={e => setCode(e.target.value.toUpperCase())} placeholder="Ex: FLANGE-A1" style={inputStyle} /></Field>
           <Field label="Descrição"><input value={desc} onChange={e => setDesc(e.target.value)} placeholder="Descrição completa" style={inputStyle} /></Field>
-          <Field label="Tempo de Produção (min)"><input type="number" min="1" value={time} onChange={e => setTime(e.target.value)} placeholder="Minutos" style={inputStyle} /></Field>
+          <Field label="Tempo de Produção"><input value={time} onChange={e => setTime(e.target.value)} placeholder="Ex: 15m30s ou 1h23m45s" style={inputStyle} /></Field>
         </div>
         <div style={{ display: "flex", gap: 10 }}>
           <Btn onClick={saveItem}>{editCode !== null ? "Atualizar" : "Salvar"}</Btn>
@@ -737,9 +945,9 @@ function ItemsPage({ registeredItems, addItem, updateItem, deleteItem }) {
               <div key={item.code} style={{ display: "grid", gridTemplateColumns: "2fr 4fr 1.5fr 70px", padding: "11px 20px", borderBottom: `1px solid ${C.border}`, fontSize: 13, color: C.text, fontFamily: F, alignItems: "center" }}>
                 <span style={{ fontWeight: 700, color: C.red }}>{item.code}</span>
                 <span>{item.description}</span>
-                <span>{fmtMin(item.productionTime)}</span>
+                <span>{fmtSec(item.productionTime)}</span>
                 <div style={{ display: "flex", gap: 5 }}>
-                  <button onClick={() => { setCode(item.code); setDesc(item.description); setTime(String(item.productionTime)); setEditCode(item.code); }} style={{ background: "none", border: "none", color: C.textMuted, cursor: "pointer", fontSize: 13 }}>✎</button>
+                  <button onClick={() => { setCode(item.code); setDesc(item.description); setTime(fmtSec(item.productionTime)); setEditCode(item.code); }} style={{ background: "none", border: "none", color: C.textMuted, cursor: "pointer", fontSize: 13 }}>✎</button>
                   <button onClick={() => requestDelete(item.code)} style={{ background: "none", border: "none", color: C.danger, cursor: "pointer", fontSize: 13 }}>✕</button>
                 </div>
               </div>
@@ -747,6 +955,20 @@ function ItemsPage({ registeredItems, addItem, updateItem, deleteItem }) {
           })}
         </div>
       </div>
+    </div>
+  );
+}
+
+// ============================================================
+// KPI CARD — extracted to module level to prevent remount on each render
+// ============================================================
+function KPI({ label, value, sub, color = C.red, icon }) {
+  return (
+    <div style={{ background: C.darkCard, borderRadius: 10, border: `1px solid ${C.border}`, padding: 22, position: "relative", overflow: "hidden" }}>
+      <div style={{ position: "absolute", top: -12, right: -8, fontSize: 56, opacity: 0.06, color, fontWeight: 900 }}>{icon}</div>
+      <div style={{ fontSize: 10, fontWeight: 700, color: C.textDim, fontFamily: FH, textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 6 }}>{label}</div>
+      <div style={{ fontSize: 30, fontWeight: 900, color, fontFamily: FH, letterSpacing: "-0.02em", lineHeight: 1 }}>{value}</div>
+      {sub && <div style={{ fontSize: 12, color: C.textMuted, fontFamily: F, marginTop: 6 }}>{sub}</div>}
     </div>
   );
 }
@@ -781,19 +1003,12 @@ function ReportsPage({ orders, registeredItems, calendarSettings, dayOverrides }
   const itemMap = {}; filtered.forEach(o => { o.items.forEach(i => { if (!itemMap[i.code]) itemMap[i.code] = { code: i.code, description: i.description, quantity: 0, minutes: 0 }; itemMap[i.code].quantity += i.quantity; itemMap[i.code].minutes += i.productionTime; }); });
   const itemStats = Object.values(itemMap).sort((a, b) => b.quantity - a.quantity);
 
-  const occDays = []; for (let d = 0; d < 14; d++) { const dt = addDays(today, d); const dk = getDayKey(dt); const dw = new Date(dt + "T12:00:00").getDay(); if (dw === 0) continue; const h = dayOverrides[dt] !== undefined ? dayOverrides[dt] : (calendarSettings[dk] ?? 8); if (h === 0) continue; const m = orders.filter(o => o.productionStart === dt).reduce((s, o) => s + o.items.reduce((ss, i) => ss + i.productionTime, 0), 0); occDays.push({ date: dt, occ: Math.round((m / (h * 60)) * 100) }); }
-  const avgOcc = occDays.length ? Math.round(occDays.reduce((s, d) => s + d.occ, 0) / occDays.length) : 0;
-
-  function KPI({ label, value, sub, color = C.red, icon }) {
-    return (
-      <div style={{ background: C.darkCard, borderRadius: 10, border: `1px solid ${C.border}`, padding: 22, position: "relative", overflow: "hidden" }}>
-        <div style={{ position: "absolute", top: -12, right: -8, fontSize: 56, opacity: 0.06, color, fontWeight: 900 }}>{icon}</div>
-        <div style={{ fontSize: 10, fontWeight: 700, color: C.textDim, fontFamily: FH, textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 6 }}>{label}</div>
-        <div style={{ fontSize: 30, fontWeight: 900, color, fontFamily: FH, letterSpacing: "-0.02em", lineHeight: 1 }}>{value}</div>
-        {sub && <div style={{ fontSize: 12, color: C.textMuted, fontFamily: F, marginTop: 6 }}>{sub}</div>}
-      </div>
-    );
+  function getOrderSecondsForDay(o, dt) {
+    if (o.productionDays && o.productionDays.length > 0) { const pd = o.productionDays.find(p => p.date === dt); return pd ? pd.minutes : 0; }
+    return o.productionStart === dt ? o.items.reduce((s, i) => s + i.productionTime, 0) : 0;
   }
+  const occDays = []; for (let d = 0; d < 14; d++) { const dt = addDays(today, d); const dk = getDayKey(dt); const dw = new Date(dt + "T12:00:00").getDay(); if (dw === 0) continue; const h = dayOverrides[dt] !== undefined ? dayOverrides[dt] : (calendarSettings[dk] ?? 8); if (h === 0) continue; const m = orders.reduce((s, o) => s + getOrderSecondsForDay(o, dt), 0); occDays.push({ date: dt, occ: Math.round((m / (h * 3600)) * 100) }); }
+  const avgOcc = occDays.length ? Math.round(occDays.reduce((s, d) => s + d.occ, 0) / occDays.length) : 0;
 
   return (
     <div style={{ padding: 32, maxWidth: 1100, margin: "0 auto" }}>
@@ -818,7 +1033,7 @@ function ReportsPage({ orders, registeredItems, calendarSettings, dayOverrides }
       <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 14, marginBottom: 24 }}>
         <KPI label="Total Pedidos" value={filtered.length} sub={`${completed.length} concluídos`} icon="📋" />
         <KPI label="Unidades" value={totalUnits.toLocaleString("pt-BR")} color={C.steel} icon="📦" />
-        <KPI label="Tempo Produção" value={fmtMin(totalMin)} color={C.green} icon="⏱" />
+        <KPI label="Tempo Produção" value={fmtSec(totalMin)} color={C.green} icon="⏱" />
         <KPI label="Atrasados" value={overdue.length} sub={overdue.length ? "Atenção" : "Nenhum"} color={overdue.length ? C.danger : C.green} icon="⚠" />
       </div>
 
@@ -866,7 +1081,7 @@ function ReportsPage({ orders, registeredItems, calendarSettings, dayOverrides }
               <div key={n} style={{ display: "grid", gridTemplateColumns: "28px 2fr 1fr 1fr 1.5fr", padding: "10px 22px", borderBottom: `1px solid ${C.border}`, fontSize: 13, color: C.text, fontFamily: F, alignItems: "center" }}>
                 <span style={{ fontWeight: 900, color: i === 0 ? C.yellow : C.textDim, fontSize: 14 }}>{i + 1}</span>
                 <span style={{ fontWeight: 700 }}>{n}</span><span>{d.orders}</span><span>{d.units}</span>
-                <span style={{ color: C.red, fontWeight: 700 }}>{fmtMin(d.minutes)}</span>
+                <span style={{ color: C.red, fontWeight: 700 }}>{fmtSec(d.minutes)}</span>
               </div>
             ))}
           </div>
@@ -880,7 +1095,7 @@ function ReportsPage({ orders, registeredItems, calendarSettings, dayOverrides }
                 <span style={{ fontWeight: 900, color: i === 0 ? C.yellow : C.textDim, fontSize: 14 }}>{i + 1}</span>
                 <span style={{ fontWeight: 700, color: C.red }}>{it.code}</span>
                 <span style={{ fontSize: 12 }}>{it.description}</span><span>{it.quantity}</span>
-                <span style={{ color: C.steel, fontWeight: 700 }}>{fmtMin(it.minutes)}</span>
+                <span style={{ color: C.steel, fontWeight: 700 }}>{fmtSec(it.minutes)}</span>
               </div>
             ))}
           </div>
@@ -930,22 +1145,22 @@ function ExportPage({ orders, registeredItems }) {
   function genCSV() {
     const data = exportType === "items" ? null : getFiltered();
     if (exportType === "items") {
-      const rows = [["Código", "Descrição", "Tempo (min)", "Tempo"]];
-      registeredItems.forEach(i => rows.push([i.code, i.description, i.productionTime, fmtMin(i.productionTime)]));
+      const rows = [["Código", "Descrição", "Tempo (seg)", "Tempo"]];
+      registeredItems.forEach(i => rows.push([i.code, i.description, i.productionTime, fmtSec(i.productionTime)]));
       return rows.map(r => r.map(esc).join(",")).join("\n");
     }
     if (exportType === "orders") {
-      const rows = [["Cliente", "Pedido", "Status", "Entrega", "Início", "Fim", "Itens", "Unidades", "Tempo (min)", "Obs"]];
+      const rows = [["Cliente", "Pedido", "Status", "Entrega", "Início", "Fim", "Itens", "Unidades", "Tempo (seg)", "Obs"]];
       data.forEach(o => rows.push([o.client, o.orderNumber, o.status, o.deliveryDate, o.productionStart, o.productionEnd, o.items.length, o.items.reduce((s, i) => s + i.quantity, 0), o.items.reduce((s, i) => s + i.productionTime, 0), o.observations || ""]));
       return rows.map(r => r.map(esc).join(",")).join("\n");
     }
     if (exportType === "order-detail") {
-      const rows = [["Cliente", "Pedido", "Status", "Código", "Descrição", "Qtd", "Tempo (min)", "Concluído"]];
+      const rows = [["Cliente", "Pedido", "Status", "Código", "Descrição", "Qtd", "Tempo (seg)", "Concluído"]];
       data.forEach(o => o.items.forEach(i => rows.push([o.client, o.orderNumber, o.status, i.code, i.description, i.quantity, i.productionTime, o.itemsCompleted?.[i.code] ? "Sim" : "Não"])));
       return rows.map(r => r.map(esc).join(",")).join("\n");
     }
     // report
-    const rows = [["RELATÓRIO DE PRODUÇÃO"], ["Gerado", new Date().toLocaleString("pt-BR")], [], ["Resumo"], ["Total Pedidos", data.length], ["Concluídos", data.filter(o => o.status === "completed").length], ["Em Execução", data.filter(o => o.status === "executing").length], ["Programados", data.filter(o => o.status === "scheduled").length], ["Unidades", data.reduce((s, o) => s + o.items.reduce((ss, i) => ss + i.quantity, 0), 0)], ["Tempo Total (min)", data.reduce((s, o) => s + o.items.reduce((ss, i) => ss + i.productionTime, 0), 0)]];
+    const rows = [["RELATÓRIO DE PRODUÇÃO"], ["Gerado", new Date().toLocaleString("pt-BR")], [], ["Resumo"], ["Total Pedidos", data.length], ["Concluídos", data.filter(o => o.status === "completed").length], ["Em Execução", data.filter(o => o.status === "executing").length], ["Programados", data.filter(o => o.status === "scheduled").length], ["Unidades", data.reduce((s, o) => s + o.items.reduce((ss, i) => ss + i.quantity, 0), 0)], ["Tempo Total (seg)", data.reduce((s, o) => s + o.items.reduce((ss, i) => ss + i.productionTime, 0), 0)]];
     return rows.map(r => r.map(esc).join(",")).join("\n");
   }
 
@@ -1045,6 +1260,418 @@ function ExportPage({ orders, registeredItems }) {
 }
 
 // ============================================================
+// PAGE 7: LOGÍSTICA
+// ============================================================
+function LogisticsPage({ orders, logistics, saveLogistics, updateOrder }) {
+  const today = getToday();
+  const completedOrders = orders.filter(o => o.status === "completed");
+  const [confirm, setConfirm] = useState(null);
+  const [faturarModal, setFaturarModal] = useState(null); // { orderId, carrier }
+  const [editarModal, setEditarModal] = useState(null);   // { orderId, carrier, location, invoiceDate }
+  const [localModal, setLocalModal] = useState(null);     // { orderId, location }
+
+  function getLogi(orderId) {
+    const d = logistics[String(orderId)] || {};
+    return {
+      location:       d.location       || "",
+      invoiced:       d.invoiced       || false,
+      invoiceDate:    d.invoiceDate    || "",
+      carrier:        d.carrier        || d.collectionMethod || "",
+      collected:      d.collected      || false,
+      completionDate: d.completionDate || "",
+    };
+  }
+  function updateLogi(orderId, changes) {
+    const curr = getLogi(orderId);
+    saveLogistics({ ...logistics, [String(orderId)]: { ...curr, ...changes } });
+  }
+  function allItemsDone(o) {
+    return o.items.length === 0 || o.items.every(i => o.itemsCompleted[i.code]);
+  }
+  function getMissing(o) {
+    return o.items.filter(i => !o.itemsCompleted[i.code]);
+  }
+
+  const sortByDate = (a, b) => (b.deliveryDate || "").localeCompare(a.deliveryDate || "");
+  const withMissing = completedOrders.filter(o => !allItemsDone(o) && !getLogi(o.id).invoiced).sort(sortByDate);
+  const notInvoiced = completedOrders.filter(o =>  allItemsDone(o) && !getLogi(o.id).invoiced).sort(sortByDate);
+  const invoiced    = completedOrders.filter(o => getLogi(o.id).invoiced && !getLogi(o.id).collected).sort(sortByDate);
+
+  // Marcar item faltante como pronto
+  function requestMarkItem(orderId, itemCode, itemDesc) {
+    setConfirm({
+      message: `Confirmar entrega do item "${itemCode} — ${itemDesc}"?`,
+      onYes: () => {
+        const order = orders.find(o => o.id === orderId);
+        if (!order) return;
+        updateOrder(orderId, { itemsCompleted: { ...order.itemsCompleted, [itemCode]: true } });
+        setConfirm(null);
+      },
+      onNo: () => setConfirm(null),
+    });
+  }
+
+  // Faturar: abre modal (localização já foi definida na conclusão do pedido)
+  function openFaturar(o) {
+    const lg = getLogi(o.id);
+    setFaturarModal({ orderId: o.id, carrier: lg.carrier });
+  }
+  function confirmFaturar() {
+    if (!faturarModal) return;
+    updateLogi(faturarModal.orderId, {
+      invoiced: true,
+      invoiceDate: today,
+      carrier: faturarModal.carrier,
+    });
+    setFaturarModal(null);
+  }
+
+  // Definir/corrigir localização (seções 1 e 2 — antes do faturamento)
+  function openLocal(o) {
+    const lg = getLogi(o.id);
+    setLocalModal({ orderId: o.id, location: lg.location });
+  }
+  function confirmLocal() {
+    if (!localModal) return;
+    updateLogi(localModal.orderId, { location: localModal.location });
+    setLocalModal(null);
+  }
+
+  // Expedido: confirmação
+  function requestExpedir(o) {
+    setConfirm({
+      message: `Confirmar expedição do pedido #${o.orderNumber} — ${o.client}? O pedido sairá da logística e ficará verde no calendário.`,
+      onYes: () => { updateLogi(o.id, { collected: true }); setConfirm(null); },
+      onNo: () => setConfirm(null),
+    });
+  }
+
+  // Editar (seção 3 — corrigir transportadora/localização/data)
+  function openEditar(o) {
+    const lg = getLogi(o.id);
+    setEditarModal({ orderId: o.id, carrier: lg.carrier, location: lg.location, invoiceDate: lg.invoiceDate });
+  }
+  function confirmEditar() {
+    if (!editarModal) return;
+    updateLogi(editarModal.orderId, { carrier: editarModal.carrier, location: editarModal.location, invoiceDate: editarModal.invoiceDate });
+    setEditarModal(null);
+  }
+
+  const HDR = { padding: "8px 20px", borderBottom: `1px solid ${C.border}`, fontSize: 10, fontWeight: 700, color: C.textDim, fontFamily: FH, textTransform: "uppercase", letterSpacing: "0.06em", display: "grid", alignItems: "center" };
+  const ROW = { padding: "12px 20px", borderBottom: `1px solid ${C.border}`, fontSize: 13, color: C.text, fontFamily: F, display: "grid", alignItems: "center" };
+
+  const sectionTitle = (icon, title, color, count) => (
+    <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 14 }}>
+      <span style={{ fontSize: 16 }}>{icon}</span>
+      <h2 style={{ margin: 0, fontSize: 16, fontWeight: 800, color, fontFamily: FH, textTransform: "uppercase", letterSpacing: "0.06em" }}>{title}</h2>
+      <span style={{ fontSize: 12, color: C.textMuted, fontFamily: F }}>({count})</span>
+    </div>
+  );
+
+  const COLS2 = "90px 1.5fr 120px 120px 130px 110px";
+  const COLS3 = "90px 1.8fr 1.5fr 1.5fr 130px 90px 60px";
+
+  return (
+    <div style={{ padding: 32, maxWidth: 1300, margin: "0 auto" }}>
+      <ConfirmDialog open={!!confirm} message={confirm?.message || ""} onYes={confirm?.onYes} onNo={confirm?.onNo} />
+
+      {/* ── MODAL FATURAR ───────────────────────────────────── */}
+      <Modal open={!!faturarModal} onClose={() => setFaturarModal(null)} title="Faturar Pedido" width={500}>
+        {faturarModal && (() => {
+          const o = orders.find(x => x.id === faturarModal.orderId);
+          if (!o) return null;
+          return (
+            <div>
+              <div style={{ display: "flex", gap: 20, marginBottom: 22, padding: 14, background: C.dark, borderRadius: 8, border: `1px solid ${C.border}` }}>
+                <div><div style={{ fontSize: 10, color: C.textDim, fontFamily: FH, textTransform: "uppercase", fontWeight: 700 }}>Pedido</div><div style={{ fontSize: 15, fontWeight: 800, color: C.red, fontFamily: FH }}>#{o.orderNumber}</div></div>
+                <div><div style={{ fontSize: 10, color: C.textDim, fontFamily: FH, textTransform: "uppercase", fontWeight: 700 }}>Cliente</div><div style={{ fontSize: 15, fontWeight: 800, color: C.text, fontFamily: FH }}>{o.client}</div></div>
+                <div><div style={{ fontSize: 10, color: C.textDim, fontFamily: FH, textTransform: "uppercase", fontWeight: 700 }}>Prev. Entrega</div><div style={{ fontSize: 15, fontWeight: 800, color: C.text, fontFamily: FH }}>{fmtDateFull(o.deliveryDate)}</div></div>
+              </div>
+              <Field label="Transportadora">
+                <input value={faturarModal.carrier} onChange={e => setFaturarModal({ ...faturarModal, carrier: e.target.value })} placeholder="Ex: São Miguel, Retirada cliente, Transportadora X" style={inputStyle} autoFocus />
+              </Field>
+              <div style={{ display: "flex", gap: 12, justifyContent: "flex-end" }}>
+                <button onClick={() => setFaturarModal(null)} style={{ padding: "10px 24px", borderRadius: 6, border: `1px solid ${C.border}`, background: C.darkInput, color: C.textMuted, cursor: "pointer", fontFamily: FH, fontSize: 14, fontWeight: 600 }}>Cancelar</button>
+                <button onClick={confirmFaturar} style={{ padding: "10px 24px", borderRadius: 6, border: "none", background: C.green, color: "#fff", cursor: "pointer", fontFamily: FH, fontSize: 14, fontWeight: 700 }}>✓ Confirmar Faturamento</button>
+              </div>
+            </div>
+          );
+        })()}
+      </Modal>
+
+      {/* ── MODAL LOCALIZAÇÃO (Seções 1 e 2) ────────────────── */}
+      <Modal open={!!localModal} onClose={() => setLocalModal(null)} title="Localização no Estoque" width={420}>
+        {localModal && (
+          <div>
+            <Field label="Localização no estoque">
+              <input value={localModal.location} onChange={e => setLocalModal({ ...localModal, location: e.target.value })} placeholder="Ex: EXP-2 E-09" style={inputStyle} autoFocus />
+            </Field>
+            <div style={{ display: "flex", gap: 12, justifyContent: "flex-end" }}>
+              <button onClick={() => setLocalModal(null)} style={{ padding: "10px 24px", borderRadius: 6, border: `1px solid ${C.border}`, background: C.darkInput, color: C.textMuted, cursor: "pointer", fontFamily: FH, fontSize: 14, fontWeight: 600 }}>Cancelar</button>
+              <button onClick={confirmLocal} style={{ padding: "10px 24px", borderRadius: 6, border: "none", background: C.red, color: "#fff", cursor: "pointer", fontFamily: FH, fontSize: 14, fontWeight: 700 }}>Salvar</button>
+            </div>
+          </div>
+        )}
+      </Modal>
+
+      {/* ── MODAL EDITAR (Seção 3) ──────────────────────────── */}
+      <Modal open={!!editarModal} onClose={() => setEditarModal(null)} title="Editar Informações" width={460}>
+        {editarModal && (
+          <div>
+            <Field label="Transportadora">
+              <input value={editarModal.carrier} onChange={e => setEditarModal({ ...editarModal, carrier: e.target.value })} placeholder="Transportadora ou forma de coleta" style={inputStyle} />
+            </Field>
+            <Field label="Localização no estoque">
+              <input value={editarModal.location} onChange={e => setEditarModal({ ...editarModal, location: e.target.value })} placeholder="Ex: EXP-2 E-09" style={inputStyle} />
+            </Field>
+            <Field label="Data do Faturamento">
+              <input type="date" value={editarModal.invoiceDate} onChange={e => setEditarModal({ ...editarModal, invoiceDate: e.target.value })} style={inputStyle} />
+            </Field>
+            <div style={{ display: "flex", gap: 12, justifyContent: "flex-end" }}>
+              <button onClick={() => setEditarModal(null)} style={{ padding: "10px 24px", borderRadius: 6, border: `1px solid ${C.border}`, background: C.darkInput, color: C.textMuted, cursor: "pointer", fontFamily: FH, fontSize: 14, fontWeight: 600 }}>Cancelar</button>
+              <button onClick={confirmEditar} style={{ padding: "10px 24px", borderRadius: 6, border: "none", background: C.red, color: "#fff", cursor: "pointer", fontFamily: FH, fontSize: 14, fontWeight: 700 }}>Salvar</button>
+            </div>
+          </div>
+        )}
+      </Modal>
+
+      <h1 style={{ margin: "0 0 28px", fontSize: 26, fontWeight: 800, color: C.text, fontFamily: FH, letterSpacing: "0.02em" }}>Logística</h1>
+
+      {/* ── SEÇÃO 1: CONCLUÍDOS COM ITENS FALTANTES ─────────── */}
+      {withMissing.length > 0 && (
+        <div style={{ marginBottom: 28 }}>
+          {sectionTitle("⚠", "Concluídos com Itens Faltantes", C.danger, withMissing.length)}
+          <div style={{ background: C.darkCard, borderRadius: 10, border: `1px solid ${C.danger}30`, overflow: "hidden" }}>
+            {withMissing.map((o, idx) => {
+              const lg = getLogi(o.id);
+              const missing = getMissing(o);
+              return (
+                <div key={o.id} style={{ borderBottom: idx < withMissing.length - 1 ? `1px solid ${C.border}` : "none" }}>
+                  {/* cabeçalho do pedido */}
+                  <div style={{ display: "grid", gridTemplateColumns: "90px 1.5fr 130px 130px 130px 32px", padding: "14px 20px", alignItems: "center", background: "rgba(239,68,68,0.05)", gap: 8 }}>
+                    <span style={{ fontWeight: 800, color: C.red, fontFamily: FH, fontSize: 14 }}>#{o.orderNumber}</span>
+                    <span style={{ fontWeight: 700, color: C.text, fontFamily: F, fontSize: 13 }}>{o.client}</span>
+                    <div>
+                      <div style={{ fontSize: 10, color: C.textDim, fontFamily: FH, textTransform: "uppercase", fontWeight: 700, marginBottom: 2 }}>Conclusão</div>
+                      <span style={{ color: C.textMuted, fontSize: 12, fontFamily: F }}>{lg.completionDate ? fmtDateFull(lg.completionDate) : "—"}</span>
+                    </div>
+                    <div>
+                      <div style={{ fontSize: 10, color: C.textDim, fontFamily: FH, textTransform: "uppercase", fontWeight: 700, marginBottom: 2 }}>Prev. Entrega</div>
+                      <span style={{ color: C.textMuted, fontSize: 12, fontFamily: F }}>{fmtDateFull(o.deliveryDate)}</span>
+                    </div>
+                    <div>
+                      <div style={{ fontSize: 10, color: C.textDim, fontFamily: FH, textTransform: "uppercase", fontWeight: 700, marginBottom: 2 }}>Localização</div>
+                      <span style={{ color: lg.location ? C.text : C.textDim, fontSize: 12, fontFamily: F }}>{lg.location || "—"}</span>
+                    </div>
+                    <button onClick={() => openLocal(o)} title="Editar localização" style={{ background: "none", border: "none", color: C.textMuted, cursor: "pointer", fontSize: 13 }}>✎</button>
+                  </div>
+                  {/* itens faltantes */}
+                  <div style={{ padding: "0 20px 14px 36px" }}>
+                    <div style={{ fontSize: 10, color: C.danger, fontFamily: FH, textTransform: "uppercase", fontWeight: 700, marginBottom: 8, letterSpacing: "0.06em" }}>
+                      Itens Faltantes ({missing.length})
+                    </div>
+                    {missing.map(item => (
+                      <div key={item.code} style={{ display: "grid", gridTemplateColumns: "1.5fr 2.5fr 50px 120px", padding: "9px 14px", borderRadius: 6, background: C.dark, border: `1px solid ${C.border}`, marginBottom: 6, alignItems: "center", gap: 10 }}>
+                        <span style={{ fontWeight: 700, color: C.red, fontFamily: FH, fontSize: 12 }}>{item.code}</span>
+                        <span style={{ color: C.textMuted, fontFamily: F, fontSize: 12 }}>{item.description}</span>
+                        <span style={{ color: C.text, fontFamily: F, fontSize: 12, textAlign: "center" }}>{item.quantity}</span>
+                        <button onClick={() => requestMarkItem(o.id, item.code, item.description)}
+                          style={{ padding: "5px 10px", borderRadius: 5, border: `1px solid ${C.green}55`, background: C.greenDim, color: C.green, cursor: "pointer", fontFamily: FH, fontSize: 11, fontWeight: 700, whiteSpace: "nowrap" }}>
+                          ✓ Marcar Pronto
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {/* ── SEÇÃO 2: CONCLUÍDOS — AGUARDANDO FATURAMENTO ───── */}
+      {notInvoiced.length > 0 && (
+        <div style={{ marginBottom: 28 }}>
+          {sectionTitle("📋", "Concluídos — Aguardando Faturamento", C.yellow, notInvoiced.length)}
+          <div style={{ background: C.darkCard, borderRadius: 10, border: `1px solid ${C.border}`, overflow: "hidden" }}>
+            <div style={{ ...HDR, gridTemplateColumns: COLS2 }}>
+              <span>Pedido</span><span>Cliente</span><span>Conclusão</span><span>Prev. Entrega</span><span>Localização</span><span />
+            </div>
+            {notInvoiced.map(o => {
+              const lg = getLogi(o.id);
+              return (
+                <div key={o.id} style={{ ...ROW, gridTemplateColumns: COLS2 }}>
+                  <span style={{ fontWeight: 800, color: C.red }}>#{o.orderNumber}</span>
+                  <span style={{ fontWeight: 700 }}>{o.client}</span>
+                  <span style={{ color: C.textMuted, fontSize: 12 }}>{lg.completionDate ? fmtDateFull(lg.completionDate) : "—"}</span>
+                  <span style={{ color: C.textMuted, fontSize: 12 }}>{fmtDateFull(o.deliveryDate)}</span>
+                  <span style={{ color: lg.location ? C.text : C.textDim, fontSize: 12 }}>{lg.location || "—"}</span>
+                  <div style={{ display: "flex", gap: 6 }}>
+                    <button onClick={() => openFaturar(o)}
+                      style={{ padding: "5px 14px", borderRadius: 5, border: `1px solid ${C.yellow}55`, background: C.yellowDim, color: C.yellow, cursor: "pointer", fontFamily: FH, fontSize: 11, fontWeight: 700 }}>
+                      Faturar
+                    </button>
+                    <button onClick={() => openLocal(o)} title="Editar localização" style={{ background: "none", border: "none", color: C.textMuted, cursor: "pointer", fontSize: 13 }}>✎</button>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {/* ── SEÇÃO 3: FATURADOS — AGUARDANDO EXPEDIÇÃO ────────── */}
+      <div style={{ marginBottom: 28 }}>
+        {sectionTitle("✅", "Faturados — Aguardando Expedição", C.green, invoiced.length)}
+        <div style={{ background: C.darkCard, borderRadius: 10, border: `1px solid ${C.border}`, overflow: "hidden" }}>
+          <div style={{ ...HDR, gridTemplateColumns: COLS3 }}>
+            <span>Pedido</span><span>Cliente</span><span>Transportadora</span><span>Localização</span><span>Dt. Faturamento</span><span>Expedido</span><span />
+          </div>
+          {invoiced.length === 0 && (
+            <div style={{ padding: 24, textAlign: "center", color: C.textDim, fontSize: 13, fontFamily: F }}>Nenhum pedido aguardando expedição</div>
+          )}
+          {invoiced.map(o => {
+            const lg = getLogi(o.id);
+            return (
+              <div key={o.id} style={{ ...ROW, gridTemplateColumns: COLS3 }}>
+                <span style={{ fontWeight: 800, color: C.red }}>#{o.orderNumber}</span>
+                <span style={{ fontWeight: 700 }}>{o.client}</span>
+                <span style={{ color: lg.carrier ? C.text : C.textDim, fontSize: 12 }}>{lg.carrier || "—"}</span>
+                <span style={{ color: lg.location ? C.text : C.textDim, fontSize: 12 }}>{lg.location || "—"}</span>
+                <span style={{ color: C.textMuted, fontSize: 12 }}>{lg.invoiceDate ? fmtDateFull(lg.invoiceDate) : "—"}</span>
+                <button onClick={() => requestExpedir(o)}
+                  style={{ padding: "5px 12px", borderRadius: 5, border: `1px solid ${C.green}55`, background: C.greenDim, color: C.green, cursor: "pointer", fontFamily: FH, fontSize: 11, fontWeight: 700 }}>
+                  Expedido
+                </button>
+                <button onClick={() => openEditar(o)}
+                  style={{ padding: "5px 10px", borderRadius: 5, border: `1px solid ${C.border}`, background: C.darkInput, color: C.textMuted, cursor: "pointer", fontFamily: FH, fontSize: 11, fontWeight: 700 }}>
+                  ✎
+                </button>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// PAGE 8: USUÁRIOS (gestor only)
+// ============================================================
+function UsersPage({ users, addUser, updateUser, deleteUser, currentUser }) {
+  const [name, setName] = useState("");
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [role, setRole] = useState("montador");
+  const [editUsername, setEditUsername] = useState(null);
+  const [search, setSearch] = useState("");
+  const [confirm, setConfirm] = useState(null);
+
+  const filtered = users.filter(u =>
+    u.name.toLowerCase().includes(search.toLowerCase()) ||
+    u.username.toLowerCase().includes(search.toLowerCase())
+  );
+
+  function saveUser() {
+    if (!name || !role) return alert("Preencha nome e perfil.");
+    if (editUsername !== null) {
+      updateUser(editUsername, { name, role, ...(password ? { password } : {}) });
+      setEditUsername(null);
+    } else {
+      if (!username || !password) return alert("Preencha todos os campos.");
+      if (users.find(u => u.username === username)) return alert("Usuário já existe.");
+      addUser({ username, password, name, role });
+    }
+    setName(""); setUsername(""); setPassword(""); setRole("montador");
+  }
+
+  function startEdit(u) {
+    setEditUsername(u.username); setName(u.name); setUsername(u.username); setPassword(""); setRole(u.role);
+  }
+
+  function requestDelete(u) {
+    if (u.username === currentUser.username) return alert("Você não pode excluir seu próprio usuário.");
+    setConfirm({ message: `Excluir o usuário "${u.name}" (${u.username})?`, onYes: () => { deleteUser(u.username); setConfirm(null); }, onNo: () => setConfirm(null) });
+  }
+
+  const roleOptions = [
+    { value: "gestor", label: "Gestor", desc: "Acesso total + gestão de usuários" },
+    { value: "montador", label: "Montador", desc: "Produção, calendário, demandas, itens, logística" },
+    { value: "vendedor", label: "Vendedor", desc: "Cadastra demandas, visualiza calendário" },
+  ];
+
+  return (
+    <div style={{ padding: 32, maxWidth: 960, margin: "0 auto" }}>
+      <ConfirmDialog open={!!confirm} message={confirm?.message || ""} onYes={confirm?.onYes} onNo={confirm?.onNo} />
+      <h1 style={{ margin: "0 0 28px", fontSize: 26, fontWeight: 800, color: C.text, fontFamily: FH, letterSpacing: "0.02em" }}>Cadastro de Usuários</h1>
+
+      <div style={{ background: C.darkCard, borderRadius: 10, border: `1px solid ${C.border}`, padding: 24, marginBottom: 28 }}>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 14, marginBottom: 14 }}>
+          <Field label="Nome Completo">
+            <input value={name} onChange={e => setName(e.target.value)} placeholder="Nome do colaborador" style={inputStyle} />
+          </Field>
+          <Field label="Usuário (login)">
+            <input value={username} onChange={e => setUsername(e.target.value.toLowerCase().replace(/\s/g, ""))} placeholder="Ex: joao.santos" style={inputStyle} disabled={editUsername !== null} />
+          </Field>
+          <Field label={editUsername !== null ? "Nova Senha (vazio = manter)" : "Senha"}>
+            <input type="password" value={password} onChange={e => setPassword(e.target.value)} placeholder={editUsername !== null ? "Deixe vazio para manter" : "Defina a senha"} style={inputStyle} />
+          </Field>
+        </div>
+        <div style={{ marginBottom: 16 }}>
+          <label style={labelStyle}>Perfil de Acesso</label>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 10 }}>
+            {roleOptions.map(r => (
+              <button key={r.value} onClick={() => setRole(r.value)} style={{ padding: "14px 16px", borderRadius: 8, cursor: "pointer", textAlign: "left", background: role === r.value ? C.redDim : C.darkInput, border: role === r.value ? `2px solid ${ROLE_COLORS[r.value]}` : `1px solid ${C.border}`, transition: "all 0.12s" }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
+                  <span style={{ width: 10, height: 10, borderRadius: "50%", background: ROLE_COLORS[r.value] }} />
+                  <span style={{ fontSize: 14, fontWeight: 800, fontFamily: FH, color: role === r.value ? ROLE_COLORS[r.value] : C.text }}>{r.label}</span>
+                </div>
+                <div style={{ fontSize: 11, color: C.textMuted, fontFamily: F, lineHeight: 1.4 }}>{r.desc}</div>
+              </button>
+            ))}
+          </div>
+        </div>
+        <div style={{ display: "flex", gap: 10 }}>
+          <Btn onClick={saveUser}>{editUsername !== null ? "Atualizar" : "Cadastrar Usuário"}</Btn>
+          {editUsername !== null && <Btn variant="ghost" onClick={() => { setEditUsername(null); setName(""); setUsername(""); setPassword(""); setRole("montador"); }}>Cancelar</Btn>}
+        </div>
+      </div>
+
+      <div style={{ background: C.darkCard, borderRadius: 10, border: `1px solid ${C.border}` }}>
+        <div style={{ padding: "14px 20px", borderBottom: `1px solid ${C.border}`, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <span style={{ fontSize: 13, fontWeight: 700, color: C.text, fontFamily: FH, textTransform: "uppercase", letterSpacing: "0.04em" }}>Usuários ({users.length})</span>
+          <input value={search} onChange={e => setSearch(e.target.value)} placeholder="Pesquisar..." style={{ ...inputStyle, width: 200 }} />
+        </div>
+        <div style={{ display: "grid", gridTemplateColumns: "2.5fr 2fr 1.5fr 80px", padding: "8px 20px", borderBottom: `1px solid ${C.border}`, fontSize: 10, fontWeight: 700, color: C.textDim, fontFamily: FH, textTransform: "uppercase", letterSpacing: "0.08em" }}>
+          <span>Nome</span><span>Usuário</span><span>Perfil</span><span></span>
+        </div>
+        <div style={{ maxHeight: 400, overflow: "auto" }}>
+          {filtered.map((u, idx) => {
+            const rc = ROLE_COLORS[u.role] || C.steel;
+            const isSelf = u.username === currentUser.username;
+            return (
+              <div key={idx} style={{ display: "grid", gridTemplateColumns: "2.5fr 2fr 1.5fr 80px", padding: "12px 20px", borderBottom: `1px solid ${C.border}`, fontSize: 13, color: C.text, fontFamily: F, alignItems: "center", background: isSelf ? "rgba(196,18,48,0.04)" : "transparent" }}>
+                <div><span style={{ fontWeight: 700 }}>{u.name}</span>{isSelf && <span style={{ fontSize: 10, color: C.red, fontFamily: FH, marginLeft: 8, fontWeight: 700 }}>VOCÊ</span>}</div>
+                <span style={{ color: C.textMuted }}>{u.username}</span>
+                <span style={{ fontSize: 11, fontWeight: 800, padding: "3px 10px", borderRadius: 5, background: `${rc}18`, color: rc, fontFamily: FH, display: "inline-block", width: "fit-content", textTransform: "uppercase", letterSpacing: "0.04em" }}>
+                  {ROLE_LABELS[u.role] || u.role}
+                </span>
+                <div style={{ display: "flex", gap: 5 }}>
+                  <button onClick={() => startEdit(u)} style={{ background: "none", border: "none", color: C.textMuted, cursor: "pointer", fontSize: 13 }}>✎</button>
+                  {!isSelf && <button onClick={() => requestDelete(u)} style={{ background: "none", border: "none", color: C.danger, cursor: "pointer", fontSize: 13 }}>✕</button>}
+                </div>
+              </div>
+            );
+          })}
+          {filtered.length === 0 && <div style={{ padding: 24, textAlign: "center", color: C.textDim, fontSize: 13, fontFamily: F }}>Nenhum usuário encontrado</div>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
 // TOAST NOTIFICATION
 // ============================================================
 function Toast({ toasts }) {
@@ -1080,6 +1707,8 @@ const LSK = {
   clients:  'pcp_bvn_clients',
   cal:      'pcp_bvn_cal',
   overrides:'pcp_bvn_overrides',
+  logistics:'pcp_bvn_logistics',
+  users:    'pcp_bvn_users',
   sync:     'pcp_bvn_lastsync',
 };
 
@@ -1088,7 +1717,8 @@ const LSK = {
 // ============================================================
 export default function App() {
   const [currentUser, setCurrentUser] = useState(null);
-  const [users] = useState(defaultUsers);
+  const [users, setUsers] = useState(defaultUsers);
+  const [logistics, setLogistics] = useState({});
   const [activePage, setActivePage] = useState("demand");
   const [orders, setOrders] = useState([]);
   const [registeredItems, setRegisteredItems] = useState([]);
@@ -1161,6 +1791,14 @@ export default function App() {
     return () => clearTimeout(timer);
   }, [dayOverrides]);
 
+  useEffect(() => {
+    if (!syncedRef.current) return;
+    const timer = setTimeout(() => {
+      try { if (users && users.length >= 0) LS.set(LSK.users, users); } catch (e) {}
+    }, 800);
+    return () => clearTimeout(timer);
+  }, [users]);
+
   function showToast(message, type = "error") {
     const id = Date.now();
     setToasts(prev => [...prev, { id, message, type }]);
@@ -1168,7 +1806,11 @@ export default function App() {
   }
 
   function mapOrder(o) {
-    return { id: o.id, client: o.client, orderNumber: o.order_number, deliveryDate: o.delivery_date, productionStart: o.production_start, productionEnd: o.production_end, status: o.status, observations: o.observations || '', items: o.items || [], itemsCompleted: o.items_completed || {} };
+    const status = o.status === 'delivered' ? 'completed' : o.status;
+    return { id: o.id, client: o.client, orderNumber: o.order_number, deliveryDate: o.delivery_date, productionStart: o.production_start, productionEnd: o.production_end, status, observations: o.observations || '', items: o.items || [], itemsCompleted: o.items_completed || {}, productionDays: o.production_days || [] };
+  }
+  function mapUser(u) {
+    return { username: u.username, password: u.password, name: u.name || u.username, role: u.role };
   }
   function mapItem(i) {
     return { code: i.code, description: i.description, productionTime: i.production_time };
@@ -1186,6 +1828,8 @@ export default function App() {
       clients:  LS.get(LSK.clients,  []),
       cal:      LS.get(LSK.cal,      null),
       overrides:LS.get(LSK.overrides,{}),
+      logistics:LS.get(LSK.logistics,{}),
+      users:    LS.get(LSK.users,    null),
       sync:     LS.get(LSK.sync,     null),
     };
     const hasCache = cached.orders !== null && cached.items !== null;
@@ -1196,6 +1840,8 @@ export default function App() {
       setClientHistory(cached.clients);
       if (cached.cal) setCalendarSettings(cached.cal);
       setDayOverrides(cached.overrides);
+      setLogistics(cached.logistics);
+      if (cached.users && cached.users.length > 0) setUsers(cached.users);
       syncedRef.current = true;
       setLoading(false); // app visível imediatamente
     }
@@ -1203,11 +1849,12 @@ export default function App() {
     // ── PASSO 2: sincroniza com Supabase em segundo plano ────────────────────
     setSyncing(true);
     try {
-      const [itemsRes, ordersRes, clientsRes, settingsRes] = await Promise.all([
+      const [itemsRes, ordersRes, clientsRes, settingsRes, usersRes] = await Promise.all([
         supabase.from('items').select('*'),
         supabase.from('orders').select('*'),
         supabase.from('client_history').select('name'),
-        supabase.from('settings').select('*').eq('id', 1).maybeSingle(),
+        supabase.from('settings').select('*'),
+        supabase.from('users').select('*'),
       ]);
       if (itemsRes.error) throw itemsRes.error;
       if (ordersRes.error) throw ordersRes.error;
@@ -1216,14 +1863,24 @@ export default function App() {
       if (newItems.length > 0) {
         setRegisteredItems(newItems);
       } else if ((cached.items || []).length > 0) {
-        // Supabase retornou vazio mas cache local tem dados — mantém o cache
         showToast("Catálogo de itens vazio no servidor — cache local restaurado.", "warning");
       }
       if (ordersRes.data) setOrders(ordersRes.data.map(mapOrder));
       if (clientsRes.data) setClientHistory(clientsRes.data.map(c => c.name));
       if (settingsRes.data) {
-        setCalendarSettings(settingsRes.data.calendar_settings);
-        setDayOverrides(settingsRes.data.day_overrides || {});
+        const calRow = settingsRes.data.find(r => r.key === 'calendar');
+        const overRow = settingsRes.data.find(r => r.key === 'day_overrides');
+        const logRow = settingsRes.data.find(r => r.key === 'logistics');
+        if (calRow) setCalendarSettings(calRow.value);
+        if (overRow) setDayOverrides(overRow.value || {});
+        if (logRow) { setLogistics(logRow.value || {}); LS.set(LSK.logistics, logRow.value || {}); }
+      }
+      if (usersRes.data && usersRes.data.length > 0) {
+        const mappedUsers = usersRes.data.map(mapUser);
+        setUsers(mappedUsers);
+        LS.set(LSK.users, mappedUsers);
+      } else if (cached.users && cached.users.length > 0) {
+        setUsers(cached.users);
       }
       syncedRef.current = true;
       setOfflineMode(false);
@@ -1302,17 +1959,18 @@ export default function App() {
     }
     
     setOrders(prev => [...prev, order]);
-    const { error } = await supabase.from('orders').insert({ 
-      id: String(order.id), 
-      client: order.client, 
-      order_number: order.orderNumber, 
-      delivery_date: order.deliveryDate, 
-      production_start: order.productionStart, 
-      production_end: order.productionEnd, 
-      status: order.status, 
-      observations: order.observations, 
-      items: order.items, 
-      items_completed: order.itemsCompleted 
+    const { error } = await supabase.from('orders').insert({
+      id: String(order.id),
+      client: order.client,
+      order_number: order.orderNumber,
+      delivery_date: order.deliveryDate,
+      production_start: order.productionStart,
+      production_end: order.productionEnd,
+      production_days: order.productionDays || [],
+      status: order.status,
+      observations: order.observations,
+      items: order.items,
+      items_completed: order.itemsCompleted
     });
     if (error) handleSaveError(error, () => setOrders(prev => prev.filter(o => o.id !== order.id)), "Erro ao salvar pedido. Tente novamente.");
   }
@@ -1325,6 +1983,7 @@ export default function App() {
     if (changes.deliveryDate !== undefined) db.delivery_date = changes.deliveryDate;
     if (changes.productionStart !== undefined) db.production_start = changes.productionStart;
     if (changes.productionEnd !== undefined) db.production_end = changes.productionEnd;
+    if (changes.productionDays !== undefined) db.production_days = changes.productionDays;
     if (changes.status !== undefined) db.status = changes.status;
     if (changes.observations !== undefined) db.observations = changes.observations;
     if (changes.items !== undefined) db.items = changes.items;
@@ -1371,14 +2030,42 @@ export default function App() {
   async function saveCalendarSettings(newSettings) {
     const prev = calendarSettings;
     setCalendarSettings(newSettings);
-    const { error } = await supabase.from('settings').upsert({ id: 1, calendar_settings: newSettings, day_overrides: dayOverridesRef.current });
+    const { error } = await supabase.from('settings').upsert({ key: 'calendar', value: newSettings }, { onConflict: 'key' });
     if (error) handleSaveError(error, () => setCalendarSettings(prev), "Erro ao salvar configurações de calendário.");
   }
   async function saveDayOverrides(newOverrides) {
     const prev = dayOverrides;
     setDayOverrides(newOverrides);
-    const { error } = await supabase.from('settings').upsert({ id: 1, calendar_settings: calendarSettingsRef.current, day_overrides: newOverrides });
+    const { error } = await supabase.from('settings').upsert({ key: 'day_overrides', value: newOverrides }, { onConflict: 'key' });
     if (error) handleSaveError(error, () => setDayOverrides(prev), "Erro ao salvar exceções do calendário.");
+  }
+
+  async function saveLogistics(newLogistics) {
+    setLogistics(newLogistics);
+    LS.set(LSK.logistics, newLogistics);
+    await supabase.from('settings').upsert({ key: 'logistics', value: newLogistics }, { onConflict: 'key' });
+  }
+
+  async function addUser(user) {
+    setUsers(prev => [...prev, user]);
+    const { error } = await supabase.from('users').insert({ username: user.username, password: user.password, name: user.name, role: user.role });
+    if (error) handleSaveError(error, () => setUsers(prev => prev.filter(u => u.username !== user.username)), "Erro ao cadastrar usuário.");
+  }
+
+  async function updateUser(uname, changes) {
+    const prev = users.find(u => u.username === uname);
+    setUsers(p => p.map(u => u.username === uname ? { ...u, ...changes } : u));
+    const db = { name: changes.name, role: changes.role };
+    if (changes.password) db.password = changes.password;
+    const { error } = await supabase.from('users').update(db).eq('username', uname);
+    if (error) handleSaveError(error, () => { if (prev) setUsers(p => p.map(u => u.username === uname ? prev : u)); }, "Erro ao atualizar usuário.");
+  }
+
+  async function deleteUser(uname) {
+    const prev = users.find(u => u.username === uname);
+    setUsers(p => p.filter(u => u.username !== uname));
+    const { error } = await supabase.from('users').delete().eq('username', uname);
+    if (error) handleSaveError(error, () => { if (prev) setUsers(p => [...p, prev]); }, "Erro ao excluir usuário.");
   }
 
   // Helper: trata erros de save respeitando modo offline
@@ -1397,6 +2084,15 @@ export default function App() {
 
   function handleLogin(user) { setCurrentUser(user); setActivePage("demand"); }
   function handleLogout() { setCurrentUser(null); setActivePage("demand"); }
+
+  if (loading && users.length === 0) {
+    return (
+      <div style={{ width: "100vw", height: "100vh", display: "flex", alignItems: "center", justifyContent: "center", background: C.dark, flexDirection: "column", gap: 16 }}>
+        <div style={{ fontSize: 32, fontWeight: 900, color: C.red, fontFamily: "'Barlow Condensed', sans-serif" }}>BVN PCP</div>
+        <div style={{ fontSize: 14, color: C.textMuted, fontFamily: "'Barlow', sans-serif" }}>Conectando...</div>
+      </div>
+    );
+  }
 
   if (!currentUser) {
     return <LoginPage users={users} onLogin={handleLogin} />;
@@ -1442,15 +2138,17 @@ export default function App() {
           <button onClick={loadData} style={{ padding: "4px 14px", borderRadius: 4, border: "none", background: C.dark, color: C.yellow, cursor: "pointer", fontFamily: FH, fontSize: 12, fontWeight: 700, letterSpacing: "0.04em" }}>↺ Reconectar</button>
         </div>
       )}
-      <div style={{ display: "flex", height: "100vh", background: C.dark, fontFamily: F, overflow: "hidden", paddingTop: offlineMode ? 34 : 0 }}>
+      <div style={{ display: "flex", height: "100vh", background: C.dark, fontFamily: F, overflow: "hidden", paddingTop: offlineMode ? 34 : syncing ? 26 : 0 }}>
         <Sidebar activePage={activePage} setActivePage={setActivePage} currentUser={currentUser} onLogout={handleLogout} />
         <div style={{ flex: 1, overflow: "auto" }}>
-          {activePage === "demand" && <DemandPage orders={orders} addOrder={addOrder} updateOrder={updateOrder} registeredItems={registeredItems} clientHistory={clientHistory} addClient={addClient} editingOrderId={editingOrderId} setEditingOrderId={setEditingOrderId} setActivePage={setActivePage} />}
-          {activePage === "calendar" && <CalendarPage orders={orders} updateOrder={updateOrder} calendarSettings={calendarSettings} saveCalendarSettings={saveCalendarSettings} dayOverrides={dayOverrides} saveDayOverrides={saveDayOverrides} setEditingOrderId={setEditingOrderId} setActivePage={setActivePage} />}
-          {activePage === "open" && <OpenDemandsPage orders={orders} updateOrder={updateOrder} setEditingOrderId={setEditingOrderId} setActivePage={setActivePage} />}
-          {activePage === "items" && <ItemsPage registeredItems={registeredItems} addItem={addItem} updateItem={updateItem} deleteItem={deleteItem} />}
+          {activePage === "demand" && <DemandPage orders={orders} addOrder={addOrder} updateOrder={updateOrder} registeredItems={registeredItems} clientHistory={clientHistory} addClient={addClient} editingOrderId={editingOrderId} setEditingOrderId={setEditingOrderId} setActivePage={setActivePage} calendarSettings={calendarSettings} dayOverrides={dayOverrides} />}
+          {activePage === "calendar" && <CalendarPage orders={orders} updateOrder={updateOrder} calendarSettings={calendarSettings} saveCalendarSettings={saveCalendarSettings} dayOverrides={dayOverrides} saveDayOverrides={saveDayOverrides} setEditingOrderId={setEditingOrderId} setActivePage={setActivePage} logistics={logistics} />}
+          {activePage === "open" && <OpenDemandsPage orders={orders} updateOrder={updateOrder} setEditingOrderId={setEditingOrderId} setActivePage={setActivePage} logistics={logistics} saveLogistics={saveLogistics} />}
+          {activePage === "logistics" && <LogisticsPage orders={orders} logistics={logistics} saveLogistics={saveLogistics} updateOrder={updateOrder} />}
+          {activePage === "items" && (currentUser.role === "gestor" || currentUser.role === "montador") && <ItemsPage registeredItems={registeredItems} addItem={addItem} updateItem={updateItem} deleteItem={deleteItem} />}
           {activePage === "reports" && currentUser.role === "gestor" && <ReportsPage orders={orders} registeredItems={registeredItems} calendarSettings={calendarSettings} dayOverrides={dayOverrides} />}
           {activePage === "export" && currentUser.role === "gestor" && <ExportPage orders={orders} registeredItems={registeredItems} />}
+          {activePage === "users" && currentUser.role === "gestor" && <UsersPage users={users} addUser={addUser} updateUser={updateUser} deleteUser={deleteUser} currentUser={currentUser} />}
         </div>
       </div>
     </>

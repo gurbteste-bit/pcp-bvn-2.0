@@ -261,7 +261,7 @@ function LoginPage({ users, onLogin }) {
             </div>
           </div>
           <div style={{ textAlign: "center", marginTop: 12, fontSize: 10, color: C.textDim, fontFamily: F }}>
-            v1.2.0
+            v1.3.0
           </div>
         </div>
       </div>
@@ -278,6 +278,7 @@ function Sidebar({ activePage, setActivePage, currentUser, onLogout }) {
     { id: "calendar", icon: "📅", label: "Calendário", roles: ["gestor", "montador", "vendedor"] },
     { id: "open", icon: "🔄", label: "Demandas em Aberto", roles: ["gestor", "montador", "vendedor"] },
     { id: "logistics", icon: "🚚", label: "Logística", roles: ["gestor", "montador"] },
+    { id: "missing", icon: "⚠", label: "Itens Faltantes", roles: ["gestor", "montador"] },
     { id: "items", icon: "📦", label: "Cadastro de Itens", roles: ["gestor", "montador"] },
     { id: "reports", icon: "📊", label: "Relatórios", roles: ["gestor"] },
     { id: "export", icon: "📤", label: "Exportação", roles: ["gestor"] },
@@ -370,6 +371,9 @@ function DemandPage({ orders, addOrder, updateOrder, registeredItems, clientHist
   const [confirm, setConfirm] = useState(null);
   const [distMode, setDistMode] = useState(editingOrder?.productionDays?.length > 0 ? "personalizado" : "equal");
   const [productionDays, setProductionDays] = useState(editingOrder?.productionDays?.length ? [...editingOrder.productionDays] : []);
+  const [missingItems, setMissingItems] = useState(editingOrder?.missingItems ? [...editingOrder.missingItems] : []);
+  const [missingCode, setMissingCode] = useState("");
+  const [missingQtyInput, setMissingQtyInput] = useState("");
 
   const totalItems = demandItems.length;
   const totalUnits = demandItems.reduce((s, i) => s + i.quantity, 0);
@@ -383,8 +387,22 @@ function DemandPage({ orders, addOrder, updateOrder, registeredItems, clientHist
       const pd = editingOrder.productionDays || [];
       setProductionDays(pd.length ? [...pd] : []);
       setDistMode(pd.length ? "personalizado" : "equal");
+      setMissingItems(editingOrder.missingItems ? [...editingOrder.missingItems] : []);
     }
   }, [editingOrderId]);
+
+  function addMissingItem() {
+    const code = missingCode.trim().toUpperCase();
+    if (!code) return alert("Digite o código do item faltante.");
+    const qty = parseInt(missingQtyInput);
+    if (!qty || qty < 1) return alert("Quantidade deve ser um número inteiro positivo.");
+    const existing = missingItems.find(m => m.code === code);
+    if (existing) { setMissingItems(missingItems.map(m => m.code === code ? { ...m, qty: m.qty + qty } : m)); }
+    else { setMissingItems([...missingItems, { code, qty, delivered: false }]); }
+    setMissingCode(""); setMissingQtyInput("");
+  }
+  function removeMissingItem(code) { setMissingItems(missingItems.filter(m => m.code !== code)); }
+  function toggleMissingDelivered(code) { setMissingItems(missingItems.map(m => m.code === code ? { ...m, delivered: !m.delivered } : m)); }
 
   const filteredClients = clientHistory.filter(c => c.toLowerCase().includes(client.toLowerCase()) && c !== client);
   const filteredCodes = registeredItems.filter(i => i.code.toLowerCase().includes(itemCode.toLowerCase()) && i.code !== itemCode);
@@ -485,9 +503,9 @@ function DemandPage({ orders, addOrder, updateOrder, registeredItems, clientHist
       onYes: () => {
         addClient(client);
         const cm = {}; demandItems.forEach(i => cm[i.code] = false);
-        if (isEditing) { updateOrder(editingOrderId, { client, orderNumber, deliveryDate, productionStart: finalStart, productionEnd: finalEnd, productionDays: finalDays, items: demandItems, observations, itemsCompleted: { ...editingOrder.itemsCompleted, ...cm } }); setEditingOrderId(null); }
-        else { addOrder({ id: String(Date.now()), client, orderNumber, deliveryDate, productionStart: finalStart, productionEnd: finalEnd, productionDays: finalDays, items: demandItems, observations, status: "scheduled", itemsCompleted: cm }); }
-        setClient(""); setOrderNumber(""); setDeliveryDate(""); setProdStart(""); setProdEnd(""); setDemandItems([]); setObservations(""); setProductionDays([]); setDistMode("equal"); setConfirm(null);
+        if (isEditing) { updateOrder(editingOrderId, { client, orderNumber, deliveryDate, productionStart: finalStart, productionEnd: finalEnd, productionDays: finalDays, items: demandItems, observations, itemsCompleted: { ...editingOrder.itemsCompleted, ...cm }, missingItems }); setEditingOrderId(null); }
+        else { addOrder({ id: String(Date.now()), client, orderNumber, deliveryDate, productionStart: finalStart, productionEnd: finalEnd, productionDays: finalDays, items: demandItems, observations, status: "scheduled", itemsCompleted: cm, missingItems }); }
+        setClient(""); setOrderNumber(""); setDeliveryDate(""); setProdStart(""); setProdEnd(""); setDemandItems([]); setObservations(""); setProductionDays([]); setDistMode("equal"); setMissingItems([]); setConfirm(null);
       }, onNo: () => setConfirm(null),
     });
   }
@@ -499,7 +517,7 @@ function DemandPage({ orders, addOrder, updateOrder, registeredItems, clientHist
         <h1 style={{ margin: 0, fontSize: 26, fontWeight: 800, color: C.text, fontFamily: FH, letterSpacing: "0.02em" }}>
           {isEditing ? "Editar Demanda" : "Demanda de Produção"}
         </h1>
-        {isEditing && <Btn variant="ghost" onClick={() => { setEditingOrderId(null); setClient(""); setOrderNumber(""); setDeliveryDate(""); setProdStart(""); setProdEnd(""); setDemandItems([]); setObservations(""); setProductionDays([]); setDistMode("equal"); }}>← Cancelar</Btn>}
+        {isEditing && <Btn variant="ghost" onClick={() => { setEditingOrderId(null); setClient(""); setOrderNumber(""); setDeliveryDate(""); setProdStart(""); setProdEnd(""); setDemandItems([]); setObservations(""); setProductionDays([]); setDistMode("equal"); setMissingItems([]); }}>← Cancelar</Btn>}
       </div>
 
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginBottom: 20 }}>
@@ -605,6 +623,40 @@ function DemandPage({ orders, addOrder, updateOrder, registeredItems, clientHist
               {distMode === "maximo" && prodEnd && <span style={{ color: C.textMuted }}>Fim recalculado: <span style={{ color: C.text, fontWeight: 700 }}>{fmtDateFull(prodEnd)}</span></span>}
             </div>
           </>
+        )}
+      </div>
+
+      {/* Itens Faltantes — peças compradas/complementares, não fabricadas pela BVN */}
+      <div style={{ background: C.darkCard, borderRadius: 10, border: `1px solid ${C.border}`, padding: 20, marginBottom: 20 }}>
+        <div style={{ fontSize: 13, fontWeight: 700, color: C.text, marginBottom: 4, fontFamily: FH, letterSpacing: "0.04em", textTransform: "uppercase" }}>Itens Faltantes</div>
+        <div style={{ fontSize: 12, color: C.textDim, fontFamily: F, marginBottom: 14 }}>Peças compradas/complementares que não passam por montagem — sem cadastro, sem tempo de produção.</div>
+        <div style={{ display: "flex", gap: 12, alignItems: "flex-end", marginBottom: 16 }}>
+          <div style={{ flex: 2 }}>
+            <label style={labelStyle}>Código</label>
+            <input value={missingCode} onChange={e => setMissingCode(e.target.value.toUpperCase())} placeholder="Ex: PARAFUSO-M8" style={inputStyle} />
+          </div>
+          <div style={{ flex: 1 }}>
+            <label style={labelStyle}>Quantidade</label>
+            <input type="number" min="1" step="1" value={missingQtyInput} onChange={e => setMissingQtyInput(e.target.value)} placeholder="Qtd" style={inputStyle} />
+          </div>
+          <Btn onClick={addMissingItem} style={{ height: 42 }}>Adicionar</Btn>
+        </div>
+        {missingItems.length > 0 && (
+          <div>
+            <div style={{ display: "grid", gridTemplateColumns: "2fr 1fr 110px 36px", padding: "8px 4px", borderBottom: `1px solid ${C.border}`, fontSize: 10, fontWeight: 700, color: C.textDim, fontFamily: FH, textTransform: "uppercase", letterSpacing: "0.08em" }}>
+              <span>Código</span><span>Qtd</span><span>Entregue</span><span></span>
+            </div>
+            {missingItems.map(m => (
+              <div key={m.code} style={{ display: "grid", gridTemplateColumns: "2fr 1fr 110px 36px", padding: "10px 4px", borderBottom: `1px solid ${C.border}`, fontSize: 13, color: C.text, fontFamily: F, alignItems: "center" }}>
+                <span style={{ fontWeight: 700, color: C.orange }}>{m.code}</span>
+                <span>{m.qty}</span>
+                <button onClick={() => toggleMissingDelivered(m.code)} style={{ padding: "5px 12px", borderRadius: 5, border: "none", background: m.delivered ? C.greenDim : C.dangerDim, color: m.delivered ? C.green : C.danger, cursor: "pointer", fontFamily: FH, fontSize: 11, fontWeight: 700, width: "fit-content" }}>
+                  {m.delivered ? "Sim" : "Não"}
+                </button>
+                <button onClick={() => removeMissingItem(m.code)} style={{ background: "none", border: "none", color: C.danger, cursor: "pointer", fontSize: 14, padding: 0 }}>✕</button>
+              </div>
+            ))}
+          </div>
         )}
       </div>
 
@@ -779,6 +831,8 @@ function OpenDemandsPage({ orders, updateOrder, setEditingOrderId, setActivePage
   const [selectedExec, setSelectedExec] = useState(null);
   const [dragItem, setDragItem] = useState(null);
   const [deliverModal, setDeliverModal] = useState(null); // { orderId, hasMissing, location }
+  const [missingCode, setMissingCode] = useState("");
+  const [missingQtyInput, setMissingQtyInput] = useState("");
 
   function isOrderForDay(o, day) {
     if (o.productionDays && o.productionDays.length > 0) return o.productionDays.some(pd => pd.date === day);
@@ -800,6 +854,27 @@ function OpenDemandsPage({ orders, updateOrder, setEditingOrderId, setActivePage
     updateOrder(orderId, { itemsCompleted: { ...order.itemsCompleted, [code]: !order.itemsCompleted[code] } });
   }
   function allDone(o) { return o.items.every(i => o.itemsCompleted[i.code]); }
+  function addMissingItem(orderId) {
+    const code = missingCode.trim().toUpperCase();
+    if (!code) return;
+    const qty = parseInt(missingQtyInput);
+    if (!qty || qty < 1) return;
+    const order = orders.find(o => o.id === orderId);
+    if (!order) return;
+    const current = order.missingItems || [];
+    const existing = current.find(m => m.code === code);
+    const updated = existing ? current.map(m => m.code === code ? { ...m, qty: m.qty + qty } : m) : [...current, { code, qty, delivered: false }];
+    updateOrder(orderId, { missingItems: updated });
+    setMissingCode(""); setMissingQtyInput("");
+  }
+  function removeMissingItem(orderId, code) {
+    const order = orders.find(o => o.id === orderId); if (!order) return;
+    updateOrder(orderId, { missingItems: (order.missingItems || []).filter(m => m.code !== code) });
+  }
+  function toggleMissingDelivered(orderId, code) {
+    const order = orders.find(o => o.id === orderId); if (!order) return;
+    updateOrder(orderId, { missingItems: (order.missingItems || []).map(m => m.code === code ? { ...m, delivered: !m.delivered } : m) });
+  }
   function deliverOrder(id) {
     const order = orders.find(o => o.id === id);
     const hasMissing = order && order.items.length > 0 && !order.items.every(i => order.itemsCompleted[i.code]);
@@ -874,6 +949,31 @@ function OpenDemandsPage({ orders, updateOrder, setEditingOrderId, setActivePage
               </div>
             ))}
           </div>
+
+          {/* Itens Faltantes — peças compradas/complementares */}
+          <div style={{ padding: "14px 24px", borderTop: `1px solid ${C.border}`, background: C.dark }}>
+            <div style={{ fontSize: 11, fontWeight: 700, color: C.textDim, fontFamily: FH, textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 10 }}>Itens Faltantes</div>
+            <div style={{ display: "flex", gap: 10, alignItems: "flex-end", marginBottom: 10 }}>
+              <input value={missingCode} onChange={e => setMissingCode(e.target.value.toUpperCase())} placeholder="Código" style={{ ...inputStyle, flex: 2, padding: "8px 12px" }} />
+              <input type="number" min="1" value={missingQtyInput} onChange={e => setMissingQtyInput(e.target.value)} placeholder="Qtd" style={{ ...inputStyle, flex: 1, padding: "8px 12px" }} />
+              <Btn onClick={() => addMissingItem(execOrder.id)} style={{ height: 36, padding: "0 18px", fontSize: 12 }}>Adicionar</Btn>
+            </div>
+            {(execOrder.missingItems || []).length > 0 && (
+              <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                {execOrder.missingItems.map(m => (
+                  <div key={m.code} style={{ display: "flex", alignItems: "center", gap: 10, padding: "6px 10px", borderRadius: 6, background: C.darkCard, border: `1px solid ${C.border}` }}>
+                    <span style={{ fontWeight: 700, color: C.orange, fontFamily: FH, fontSize: 12, flex: 2 }}>{m.code}</span>
+                    <span style={{ color: C.textMuted, fontSize: 12, flex: 1 }}>Qtd {m.qty}</span>
+                    <button onClick={() => toggleMissingDelivered(execOrder.id, m.code)} style={{ padding: "4px 12px", borderRadius: 5, border: "none", background: m.delivered ? C.greenDim : C.dangerDim, color: m.delivered ? C.green : C.danger, cursor: "pointer", fontFamily: FH, fontSize: 11, fontWeight: 700 }}>
+                      {m.delivered ? "Entregue" : "Pendente"}
+                    </button>
+                    <button onClick={() => removeMissingItem(execOrder.id, m.code)} style={{ background: "none", border: "none", color: C.danger, cursor: "pointer", fontSize: 13 }}>✕</button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
           <div style={{ padding: "14px 24px", borderTop: `1px solid ${C.border}` }}>
             <Btn onClick={() => deliverOrder(execOrder.id)}
               style={{ width: "100%", padding: 14, fontSize: 15, textTransform: "uppercase", letterSpacing: "0.06em", background: allDone(execOrder) ? C.green : C.yellow, color: "#fff" }}>
@@ -1285,30 +1385,37 @@ function LogisticsPage({ orders, logistics, saveLogistics, updateOrder }) {
     const curr = getLogi(orderId);
     saveLogistics({ ...logistics, [String(orderId)]: { ...curr, ...changes } });
   }
-  function allItemsDone(o) {
-    return o.items.length === 0 || o.items.every(i => o.itemsCompleted[i.code]);
+  function hasNoMissingParts(o) {
+    return (o.missingItems || []).every(m => m.delivered);
   }
-  function getMissing(o) {
-    return o.items.filter(i => !o.itemsCompleted[i.code]);
+  function getMissingParts(o) {
+    return (o.missingItems || []).filter(m => !m.delivered);
   }
 
   const sortByDate = (a, b) => (b.deliveryDate || "").localeCompare(a.deliveryDate || "");
-  const withMissing = completedOrders.filter(o => !allItemsDone(o) && !getLogi(o.id).invoiced).sort(sortByDate);
-  const notInvoiced = completedOrders.filter(o =>  allItemsDone(o) && !getLogi(o.id).invoiced).sort(sortByDate);
+  const withMissing = completedOrders.filter(o => !hasNoMissingParts(o) && !getLogi(o.id).invoiced).sort(sortByDate);
+  const notInvoiced = completedOrders.filter(o =>  hasNoMissingParts(o) && !getLogi(o.id).invoiced).sort(sortByDate);
   const invoiced    = completedOrders.filter(o => getLogi(o.id).invoiced && !getLogi(o.id).collected).sort(sortByDate);
 
-  // Marcar item faltante como pronto
-  function requestMarkItem(orderId, itemCode, itemDesc) {
-    setConfirm({
-      message: `Confirmar entrega do item "${itemCode} — ${itemDesc}"?`,
-      onYes: () => {
-        const order = orders.find(o => o.id === orderId);
-        if (!order) return;
-        updateOrder(orderId, { itemsCompleted: { ...order.itemsCompleted, [itemCode]: true } });
-        setConfirm(null);
-      },
-      onNo: () => setConfirm(null),
-    });
+  // Itens faltantes (peças compradas/complementares) — Seção 1
+  function toggleMissingDelivered(orderId, code) {
+    const order = orders.find(o => o.id === orderId);
+    if (!order) return;
+    updateOrder(orderId, { missingItems: (order.missingItems || []).map(m => m.code === code ? { ...m, delivered: !m.delivered } : m) });
+  }
+  const [addMissingFor, setAddMissingFor] = useState(null); // { orderId, code, qty }
+  function confirmAddMissing() {
+    if (!addMissingFor) return;
+    const code = addMissingFor.code.trim().toUpperCase();
+    const qty = parseInt(addMissingFor.qty);
+    if (!code || !qty || qty < 1) return;
+    const order = orders.find(o => o.id === addMissingFor.orderId);
+    if (!order) return;
+    const current = order.missingItems || [];
+    const existing = current.find(m => m.code === code);
+    const updated = existing ? current.map(m => m.code === code ? { ...m, qty: m.qty + qty } : m) : [...current, { code, qty, delivered: false }];
+    updateOrder(addMissingFor.orderId, { missingItems: updated });
+    setAddMissingFor(null);
   }
 
   // Faturar: abre modal (localização já foi definida na conclusão do pedido)
@@ -1435,16 +1542,34 @@ function LogisticsPage({ orders, logistics, saveLogistics, updateOrder }) {
         )}
       </Modal>
 
+      {/* ── MODAL ADICIONAR PEÇA FALTANTE (Seção 1) ─────────── */}
+      <Modal open={!!addMissingFor} onClose={() => setAddMissingFor(null)} title="Adicionar Peça Faltante" width={420}>
+        {addMissingFor && (
+          <div>
+            <Field label="Código">
+              <input value={addMissingFor.code} onChange={e => setAddMissingFor({ ...addMissingFor, code: e.target.value.toUpperCase() })} placeholder="Ex: PARAFUSO-M8" style={inputStyle} autoFocus />
+            </Field>
+            <Field label="Quantidade">
+              <input type="number" min="1" value={addMissingFor.qty} onChange={e => setAddMissingFor({ ...addMissingFor, qty: e.target.value })} placeholder="Qtd" style={inputStyle} />
+            </Field>
+            <div style={{ display: "flex", gap: 12, justifyContent: "flex-end" }}>
+              <button onClick={() => setAddMissingFor(null)} style={{ padding: "10px 24px", borderRadius: 6, border: `1px solid ${C.border}`, background: C.darkInput, color: C.textMuted, cursor: "pointer", fontFamily: FH, fontSize: 14, fontWeight: 600 }}>Cancelar</button>
+              <button onClick={confirmAddMissing} style={{ padding: "10px 24px", borderRadius: 6, border: "none", background: C.red, color: "#fff", cursor: "pointer", fontFamily: FH, fontSize: 14, fontWeight: 700 }}>Adicionar</button>
+            </div>
+          </div>
+        )}
+      </Modal>
+
       <h1 style={{ margin: "0 0 28px", fontSize: 26, fontWeight: 800, color: C.text, fontFamily: FH, letterSpacing: "0.02em" }}>Logística</h1>
 
-      {/* ── SEÇÃO 1: CONCLUÍDOS COM ITENS FALTANTES ─────────── */}
+      {/* ── SEÇÃO 1: PRONTO COM PEÇAS FALTANTES ─────────── */}
       {withMissing.length > 0 && (
         <div style={{ marginBottom: 28 }}>
-          {sectionTitle("⚠", "Concluídos com Itens Faltantes", C.danger, withMissing.length)}
+          {sectionTitle("⚠", "Pronto com Peças Faltantes", C.danger, withMissing.length)}
           <div style={{ background: C.darkCard, borderRadius: 10, border: `1px solid ${C.danger}30`, overflow: "hidden" }}>
             {withMissing.map((o, idx) => {
               const lg = getLogi(o.id);
-              const missing = getMissing(o);
+              const missing = getMissingParts(o);
               return (
                 <div key={o.id} style={{ borderBottom: idx < withMissing.length - 1 ? `1px solid ${C.border}` : "none" }}>
                   {/* cabeçalho do pedido */}
@@ -1467,17 +1592,22 @@ function LogisticsPage({ orders, logistics, saveLogistics, updateOrder }) {
                   </div>
                   {/* itens faltantes */}
                   <div style={{ padding: "0 20px 14px 36px" }}>
-                    <div style={{ fontSize: 10, color: C.danger, fontFamily: FH, textTransform: "uppercase", fontWeight: 700, marginBottom: 8, letterSpacing: "0.06em" }}>
-                      Itens Faltantes ({missing.length})
+                    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+                      <span style={{ fontSize: 10, color: C.danger, fontFamily: FH, textTransform: "uppercase", fontWeight: 700, letterSpacing: "0.06em" }}>
+                        Peças Faltantes ({missing.length})
+                      </span>
+                      <button onClick={() => setAddMissingFor({ orderId: o.id, code: "", qty: "" })}
+                        style={{ padding: "4px 10px", borderRadius: 5, border: `1px solid ${C.border}`, background: C.darkInput, color: C.textMuted, cursor: "pointer", fontFamily: FH, fontSize: 11, fontWeight: 700 }}>
+                        + Adicionar Peça
+                      </button>
                     </div>
-                    {missing.map(item => (
-                      <div key={item.code} style={{ display: "grid", gridTemplateColumns: "1.5fr 2.5fr 50px 120px", padding: "9px 14px", borderRadius: 6, background: C.dark, border: `1px solid ${C.border}`, marginBottom: 6, alignItems: "center", gap: 10 }}>
-                        <span style={{ fontWeight: 700, color: C.red, fontFamily: FH, fontSize: 12 }}>{item.code}</span>
-                        <span style={{ color: C.textMuted, fontFamily: F, fontSize: 12 }}>{item.description}</span>
-                        <span style={{ color: C.text, fontFamily: F, fontSize: 12, textAlign: "center" }}>{item.quantity}</span>
-                        <button onClick={() => requestMarkItem(o.id, item.code, item.description)}
+                    {missing.map(m => (
+                      <div key={m.code} style={{ display: "flex", alignItems: "center", gap: 10, padding: "9px 14px", borderRadius: 6, background: C.dark, border: `1px solid ${C.border}`, marginBottom: 6 }}>
+                        <span style={{ fontWeight: 700, color: C.red, fontFamily: FH, fontSize: 12, flex: 2 }}>{m.code}</span>
+                        <span style={{ color: C.textMuted, fontFamily: F, fontSize: 12, flex: 1 }}>Qtd {m.qty}</span>
+                        <button onClick={() => toggleMissingDelivered(o.id, m.code)}
                           style={{ padding: "5px 10px", borderRadius: 5, border: `1px solid ${C.green}55`, background: C.greenDim, color: C.green, cursor: "pointer", fontFamily: FH, fontSize: 11, fontWeight: 700, whiteSpace: "nowrap" }}>
-                          ✓ Marcar Pronto
+                          ✓ Marcar Entregue
                         </button>
                       </div>
                     ))}
@@ -1552,6 +1682,105 @@ function LogisticsPage({ orders, logistics, saveLogistics, updateOrder }) {
           })}
         </div>
       </div>
+    </div>
+  );
+}
+
+// ============================================================
+// PAGE: ITENS FALTANTES (consolidado — gestor e montador)
+// ============================================================
+function MissingItemsPage({ orders, updateOrder, setEditingOrderId, setActivePage }) {
+  const rows = [];
+  orders.forEach(o => {
+    (o.missingItems || []).forEach(m => {
+      if (!m.delivered) rows.push({ orderId: o.id, orderNumber: o.orderNumber, client: o.client, status: o.status, deliveryDate: o.deliveryDate, code: m.code, qty: m.qty });
+    });
+  });
+  rows.sort((a, b) => (a.deliveryDate || "").localeCompare(b.deliveryDate || ""));
+
+  const totalUnits = rows.reduce((s, r) => s + r.qty, 0);
+  const distinctItems = new Set(rows.map(r => r.code)).size;
+  const distinctOrders = new Set(rows.map(r => r.orderId)).size;
+
+  const byItem = {};
+  rows.forEach(r => {
+    if (!byItem[r.code]) byItem[r.code] = { code: r.code, total: 0, orders: 0 };
+    byItem[r.code].total += r.qty;
+    byItem[r.code].orders += 1;
+  });
+  const itemStats = Object.values(byItem).sort((a, b) => b.total - a.total);
+
+  function markDelivered(orderId, code) {
+    const order = orders.find(o => o.id === orderId);
+    if (!order) return;
+    updateOrder(orderId, { missingItems: (order.missingItems || []).map(m => m.code === code ? { ...m, delivered: true } : m) });
+  }
+
+  const STATUS_LABEL = { scheduled: "Programado", executing: "Em Execução", completed: "Concluído" };
+  const STATUS_COLOR = { scheduled: C.red, executing: C.yellow, completed: C.blue };
+
+  const editOrder = (id) => { setEditingOrderId(id); setActivePage("demand"); };
+
+  const COLS = "80px 1.3fr 110px 1.3fr 90px 100px 90px 32px";
+
+  return (
+    <div style={{ padding: 32, maxWidth: 1300, margin: "0 auto" }}>
+      <h1 style={{ margin: "0 0 24px", fontSize: 26, fontWeight: 800, color: C.text, fontFamily: FH, letterSpacing: "0.02em" }}>Itens Faltantes</h1>
+
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 14, marginBottom: 24 }}>
+        <KPI label="Unidades Faltantes" value={totalUnits.toLocaleString("pt-BR")} icon="📦" />
+        <KPI label="Itens Distintos" value={distinctItems} color={C.steel} icon="🔧" />
+        <KPI label="Pedidos Afetados" value={distinctOrders} color={C.yellow} icon="📋" />
+      </div>
+
+      {rows.length === 0 ? (
+        <div style={{ background: C.darkCard, borderRadius: 10, border: `1px solid ${C.border}`, padding: 40, textAlign: "center", color: C.textDim, fontSize: 14, fontFamily: F }}>
+          Nenhum item faltante registrado no momento.
+        </div>
+      ) : (
+        <>
+          <div style={{ background: C.darkCard, borderRadius: 10, border: `1px solid ${C.border}`, overflow: "hidden", marginBottom: 28 }}>
+            <div style={{ padding: "14px 20px", borderBottom: `1px solid ${C.border}` }}>
+              <span style={{ fontSize: 13, fontWeight: 700, color: C.text, fontFamily: FH, textTransform: "uppercase", letterSpacing: "0.04em" }}>Faltas por Pedido</span>
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: COLS, padding: "8px 20px", borderBottom: `1px solid ${C.border}`, fontSize: 10, fontWeight: 700, color: C.textDim, fontFamily: FH, textTransform: "uppercase", letterSpacing: "0.06em" }}>
+              <span>Pedido</span><span>Cliente</span><span>Status</span><span>Código</span><span>Qtd</span><span>Entrega</span><span></span><span></span>
+            </div>
+            <div style={{ maxHeight: 420, overflow: "auto" }}>
+              {rows.map((r, idx) => (
+                <div key={r.orderId + r.code} style={{ display: "grid", gridTemplateColumns: COLS, padding: "10px 20px", borderBottom: idx < rows.length - 1 ? `1px solid ${C.border}` : "none", fontSize: 13, color: C.text, fontFamily: F, alignItems: "center", gap: 6 }}>
+                  <span style={{ fontWeight: 800, color: C.red }}>#{r.orderNumber}</span>
+                  <span style={{ fontWeight: 700 }}>{r.client}</span>
+                  <span style={{ fontSize: 11, fontWeight: 800, padding: "3px 8px", borderRadius: 5, background: `${STATUS_COLOR[r.status] || C.steel}18`, color: STATUS_COLOR[r.status] || C.steel, fontFamily: FH, width: "fit-content", textTransform: "uppercase" }}>{STATUS_LABEL[r.status] || r.status}</span>
+                  <span style={{ fontWeight: 700, color: C.orange }}>{r.code}</span>
+                  <span>{r.qty}</span>
+                  <span style={{ color: C.textMuted, fontSize: 12 }}>{fmtDateFull(r.deliveryDate)}</span>
+                  <button onClick={() => markDelivered(r.orderId, r.code)} title="Marcar entregue" style={{ padding: "5px 8px", borderRadius: 5, border: `1px solid ${C.green}55`, background: C.greenDim, color: C.green, cursor: "pointer", fontFamily: FH, fontSize: 10, fontWeight: 700 }}>✓</button>
+                  <button onClick={() => editOrder(r.orderId)} title="Abrir pedido" style={{ background: "none", border: "none", color: C.textMuted, cursor: "pointer", fontSize: 13 }}>✎</button>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <div style={{ background: C.darkCard, borderRadius: 10, border: `1px solid ${C.border}`, overflow: "hidden" }}>
+            <div style={{ padding: "14px 20px", borderBottom: `1px solid ${C.border}` }}>
+              <span style={{ fontSize: 13, fontWeight: 700, color: C.text, fontFamily: FH, textTransform: "uppercase", letterSpacing: "0.04em" }}>Total Faltante por Código (reposição)</span>
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: "2fr 1fr 1fr", padding: "8px 20px", borderBottom: `1px solid ${C.border}`, fontSize: 10, fontWeight: 700, color: C.textDim, fontFamily: FH, textTransform: "uppercase", letterSpacing: "0.06em" }}>
+              <span>Código</span><span>Qtd Total Faltante</span><span>Pedidos</span>
+            </div>
+            <div style={{ maxHeight: 300, overflow: "auto" }}>
+              {itemStats.map(it => (
+                <div key={it.code} style={{ display: "grid", gridTemplateColumns: "2fr 1fr 1fr", padding: "11px 20px", borderBottom: `1px solid ${C.border}`, fontSize: 13, color: C.text, fontFamily: F, alignItems: "center" }}>
+                  <span style={{ fontWeight: 700, color: C.orange }}>{it.code}</span>
+                  <span style={{ color: C.orange, fontWeight: 800 }}>{it.total}</span>
+                  <span>{it.orders}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        </>
+      )}
     </div>
   );
 }
@@ -1807,7 +2036,7 @@ export default function App() {
 
   function mapOrder(o) {
     const status = o.status === 'delivered' ? 'completed' : o.status;
-    return { id: o.id, client: o.client, orderNumber: o.order_number, deliveryDate: o.delivery_date, productionStart: o.production_start, productionEnd: o.production_end, status, observations: o.observations || '', items: o.items || [], itemsCompleted: o.items_completed || {}, productionDays: o.production_days || [] };
+    return { id: o.id, client: o.client, orderNumber: o.order_number, deliveryDate: o.delivery_date, productionStart: o.production_start, productionEnd: o.production_end, status, observations: o.observations || '', items: o.items || [], itemsCompleted: o.items_completed || {}, productionDays: o.production_days || [], missingItems: o.missing_items || [] };
   }
   function mapUser(u) {
     return { username: u.username, password: u.password, name: u.name || u.username, role: u.role };
@@ -1970,7 +2199,10 @@ export default function App() {
       status: order.status,
       observations: order.observations,
       items: order.items,
-      items_completed: order.itemsCompleted
+      items_completed: order.itemsCompleted,
+      missing_items: order.missingItems || [],
+      has_complementary: (order.missingItems || []).length > 0,
+      complementary_complete: (order.missingItems || []).length === 0,
     });
     if (error) handleSaveError(error, () => setOrders(prev => prev.filter(o => o.id !== order.id)), "Erro ao salvar pedido. Tente novamente.");
   }
@@ -1988,6 +2220,11 @@ export default function App() {
     if (changes.observations !== undefined) db.observations = changes.observations;
     if (changes.items !== undefined) db.items = changes.items;
     if (changes.itemsCompleted !== undefined) db.items_completed = changes.itemsCompleted;
+    if (changes.missingItems !== undefined) {
+      db.missing_items = changes.missingItems;
+      db.has_complementary = changes.missingItems.length > 0;
+      db.complementary_complete = changes.missingItems.length === 0 || changes.missingItems.every(i => i.delivered);
+    }
     const { error } = await supabase.from('orders').update(db).eq('id', String(id));
     if (error) handleSaveError(error, () => { if (prev) setOrders(p => p.map(o => o.id === id ? prev : o)); }, "Erro ao atualizar pedido. Alteração desfeita.");
   }
@@ -2145,6 +2382,7 @@ export default function App() {
           {activePage === "calendar" && <CalendarPage orders={orders} updateOrder={updateOrder} calendarSettings={calendarSettings} saveCalendarSettings={saveCalendarSettings} dayOverrides={dayOverrides} saveDayOverrides={saveDayOverrides} setEditingOrderId={setEditingOrderId} setActivePage={setActivePage} logistics={logistics} />}
           {activePage === "open" && <OpenDemandsPage orders={orders} updateOrder={updateOrder} setEditingOrderId={setEditingOrderId} setActivePage={setActivePage} logistics={logistics} saveLogistics={saveLogistics} />}
           {activePage === "logistics" && <LogisticsPage orders={orders} logistics={logistics} saveLogistics={saveLogistics} updateOrder={updateOrder} />}
+          {activePage === "missing" && (currentUser.role === "gestor" || currentUser.role === "montador") && <MissingItemsPage orders={orders} updateOrder={updateOrder} setEditingOrderId={setEditingOrderId} setActivePage={setActivePage} />}
           {activePage === "items" && (currentUser.role === "gestor" || currentUser.role === "montador") && <ItemsPage registeredItems={registeredItems} addItem={addItem} updateItem={updateItem} deleteItem={deleteItem} />}
           {activePage === "reports" && currentUser.role === "gestor" && <ReportsPage orders={orders} registeredItems={registeredItems} calendarSettings={calendarSettings} dayOverrides={dayOverrides} />}
           {activePage === "export" && currentUser.role === "gestor" && <ExportPage orders={orders} registeredItems={registeredItems} />}

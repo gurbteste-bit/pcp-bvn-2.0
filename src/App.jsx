@@ -497,7 +497,7 @@ function LoginPage({ users, onLogin }) {
             </div>
           </div>
           <div style={{ textAlign: "center", marginTop: 12, fontSize: 10, color: C.textDim, fontFamily: F }}>
-            v1.5.0
+            v1.5.1
           </div>
         </div>
       </div>
@@ -519,7 +519,7 @@ function Sidebar({ activePage, setActivePage, currentUser, onLogout, badges = {}
     { id: "items", icon: "📦", label: "Cadastro de Itens", roles: ["gestor", "montador"] },
     { id: "reports", icon: "📊", label: "Relatórios", roles: ["gestor"] },
     { id: "export", icon: "📤", label: "Exportação", roles: ["gestor"] },
-    { id: "clients", icon: "🏢", label: "Clientes", roles: ["gestor"] },
+    { id: "clients", icon: "🏢", label: "Clientes", roles: ["gestor", "montador"] },
     { id: "users", icon: "👤", label: "Usuários", roles: ["gestor"] },
   ];
 
@@ -1166,7 +1166,16 @@ function CalendarPage({ orders, updateOrder, calendarSettings, saveCalendarSetti
   const [dayConfigHours, setDayConfigHours] = useState(8);
   const [drag, setDrag] = useState(null);           // { id, from, whole }
   const [hoverKey, setHoverKey] = useState(null);
-  const clickDetailRef = useRef(0);                  // nº de cliques do último mousedown (2 = duplo-clique + arrastar)
+  const clickDetailRef = useRef(0);                  // nº de cliques do último mousedown (2 = duplo-clique segurando e arrastando)
+  // Duplo-clique (soltando) "arma" o pedido inteiro: o próximo arrasto dele move tudo. Desarma após 10s, Esc ou clique em outro pedido.
+  const [armed, setArmed] = useState(null);
+  useEffect(() => {
+    if (!armed) return;
+    const t = setTimeout(() => setArmed(null), 10000);
+    const k = e => { if (e.key === "Escape") setArmed(null); };
+    window.addEventListener("keydown", k);
+    return () => { clearTimeout(t); window.removeEventListener("keydown", k); };
+  }, [armed]);
 
   const startDate = addDays(getMonday(getToday()), weekOffset * 7);
   const daysOfWeek = ["segunda", "terca", "quarta", "quinta", "sexta", "sabado"];
@@ -1189,7 +1198,7 @@ function CalendarPage({ orders, updateOrder, calendarSettings, saveCalendarSetti
 
   function handleDrop(ds) {
     if (!drag) return;
-    const o = orders.find(x => x.id === drag.id); const d = drag; setDrag(null);
+    const o = orders.find(x => x.id === drag.id); const d = drag; setDrag(null); setArmed(null);
     if (!o) return;
     const before = normalizeDays(effectiveDays(o));
     const ch = d.whole ? moveWhole(o, ds) : (d.from === ds ? null : movePortion(o, d.from, ds));
@@ -1205,7 +1214,7 @@ function CalendarPage({ orders, updateOrder, calendarSettings, saveCalendarSetti
     <div style={{ padding: 24, height: "100vh", display: "flex", flexDirection: "column", overflow: "hidden", boxSizing: "border-box" }}>
       {drag && (
         <div style={{ position: "fixed", top: 14, left: "50%", transform: "translateX(-50%)", zIndex: 1500, padding: "8px 18px", borderRadius: 20, background: drag.whole ? C.red : C.darkCard, color: "#fff", border: `1px solid ${drag.whole ? C.red : C.border}`, fontFamily: FH, fontWeight: 800, fontSize: 13, letterSpacing: "0.04em", boxShadow: "0 8px 24px rgba(0,0,0,0.5)", pointerEvents: "none" }}>
-          {drag.whole ? "⇶ MOVENDO PEDIDO INTEIRO para um único dia" : `Movendo só a parte de ${fmtDate(drag.from)} — duplo-clique e arraste para mover o pedido inteiro`}
+          {drag.whole ? "⇶ MOVENDO PEDIDO INTEIRO para um único dia" : `Movendo só a parte de ${fmtDate(drag.from)} — para mover o pedido inteiro, dê dois cliques nele antes de arrastar`}
         </div>
       )}
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
@@ -1228,7 +1237,7 @@ function CalendarPage({ orders, updateOrder, calendarSettings, saveCalendarSetti
         </div>
       </div>
       <div style={{ fontSize: 11, color: C.textDim, fontFamily: F, marginBottom: 10 }}>
-        Arrastar = move só a parte daquele dia (divide a produção) · <strong style={{ color: C.textMuted }}>Duplo-clique e arrastar</strong> = move o pedido inteiro para um dia · ✎ = abrir pedido
+        Arrastar = move só a parte daquele dia (divide a produção) · <strong style={{ color: C.textMuted }}>Dois cliques no pedido e depois arrastar</strong> = move o pedido inteiro para um dia · ✎ = abrir pedido
       </div>
 
       <div style={{ flex: 1, overflow: "auto" }}>
@@ -1264,15 +1273,17 @@ function CalendarPage({ orders, updateOrder, calendarSettings, saveCalendarSetti
                     const movable = o.status !== "completed";
                     return (
                       <div key={o.id} data-card={key} draggable={movable}
-                        onMouseDown={e => { clickDetailRef.current = e.detail; }}
-                        onDragStart={e => { const whole = clickDetailRef.current >= 2; setDrag({ id: o.id, from: ds, whole }); try { e.dataTransfer.effectAllowed = "move"; e.dataTransfer.setData("text/plain", key); } catch {} }}
+                        onMouseDown={e => { clickDetailRef.current = e.detail; if (armed && armed !== o.id) setArmed(null); }}
+                        onDoubleClick={() => movable && setArmed(o.id)}
+                        onDragStart={e => { const whole = clickDetailRef.current >= 2 || armed === o.id; setDrag({ id: o.id, from: ds, whole }); try { e.dataTransfer.effectAllowed = "move"; e.dataTransfer.setData("text/plain", key); } catch {} }}
                         onDragEnd={() => setDrag(null)}
                         onMouseEnter={() => setHoverKey(key)} onMouseLeave={() => setHoverKey(k => k === key ? null : k)}
-                        title={movable ? "Arraste para mover esta parte · duplo-clique e arraste para mover o pedido inteiro" : "Pedido concluído"}
-                        style={{ position: "relative", padding: "5px 22px 5px 8px", borderRadius: 5, background: cardBg, cursor: movable ? "grab" : "default", fontSize: 10, fontFamily: F, color: C.text, fontWeight: 600, borderLeft: `3px solid ${cardColor}`, marginBottom: 3, userSelect: "none" }}>
+                        title={movable ? "Arraste para mover esta parte · dois cliques e depois arraste para mover o pedido inteiro" : "Pedido concluído"}
+                        style={{ position: "relative", padding: "5px 22px 5px 8px", borderRadius: 5, background: cardBg, outline: armed === o.id ? `2px solid ${C.red}` : "none", boxShadow: armed === o.id ? `0 0 10px ${C.redGlow}` : "none", cursor: movable ? "grab" : "default", fontSize: 10, fontFamily: F, color: C.text, fontWeight: 600, borderLeft: `3px solid ${cardColor}`, marginBottom: 3, userSelect: "none" }}>
                         <span style={{ fontWeight: 800, color: cardColor }}>{o.client}</span>
                         <span style={{ color: C.textMuted, marginLeft: 5 }}>#{o.orderNumber}</span>
                         {nDays > 1 && <span style={{ color: C.textMuted, marginLeft: 5, fontWeight: 700 }}>· {fmtSec(orderSecondsForDay(o, ds))}</span>}
+                        {armed === o.id && <div data-armed={o.id} style={{ marginTop: 3, fontSize: 9, fontWeight: 800, fontFamily: FH, color: C.red, letterSpacing: "0.04em" }}>⇶ PEDIDO INTEIRO — ARRASTE PARA UM DIA</div>}
                         <button onClick={e => { e.stopPropagation(); openEdit(o.id); }} title="Abrir pedido" data-edit={o.id}
                           style={{ position: "absolute", right: 3, top: "50%", transform: "translateY(-50%)", background: "none", border: "none", color: C.text, cursor: "pointer", fontSize: 11, padding: "0 3px", opacity: hoverKey === key ? 1 : 0.25 }}>✎</button>
                       </div>
@@ -1370,7 +1381,7 @@ function DropZone({ title, zone, items, color, onDragStart, onDrop, onSelect, on
 // ============================================================
 // PAGE 3: DEMANDAS EM ABERTO
 // ============================================================
-function OpenDemandsPage({ orders, updateOrder, setEditingOrderId, setActivePage, logistics, saveLogistics, currentUser, startExecution, pauseExecution, completeOrder, shift, isWorkDay }) {
+function OpenDemandsPage({ orders, updateOrder, setEditingOrderId, setActivePage, logistics, saveLogistics, currentUser, startExecution, pauseExecution, completeOrder, startTimerOnly, shift, isWorkDay }) {
   const today = getToday(); const tomorrow = getTomorrow();
   const readOnly = currentUser?.role === "vendedor";
   const [selectedExec, setSelectedExec] = useState(null);
@@ -1386,11 +1397,13 @@ function OpenDemandsPage({ orders, updateOrder, setEditingOrderId, setActivePage
   const firstDay = o => { const d = normalizeDays(effectiveDays(o)); return d.length ? d[0].date : ""; };
   const hasDay = (o, day) => effectiveDays(o).some(pd => pd.date === day);
   const scheduled = orders.filter(o => o.status === "scheduled");
-  // Hoje = programados para hoje + atrasados (dia de produção já passou e não foi iniciado)
+  // Hoje = programados para hoje + os que tinham dia de produção anterior e não foram iniciados (senão sumiriam da tela)
   const todayOrders = scheduled.filter(o => { const f = firstDay(o); return f && f <= today; }).sort((a, b) => firstDay(a).localeCompare(firstDay(b)));
   const executingOrders = orders.filter(o => o.status === "executing");
   const tomorrowOrders = scheduled.filter(o => !todayOrders.includes(o) && hasDay(o, tomorrow));
-  const isLate = o => o.status === "scheduled" && firstDay(o) && firstDay(o) < today;
+  // Atrasado = passou da DATA DE ENTREGA. Dia de produção vencido sem iniciar é outra coisa ("não iniciado").
+  const isLate = o => o.status !== "completed" && o.deliveryDate && o.deliveryDate < today;
+  const notStarted = o => o.status === "scheduled" && firstDay(o) && firstDay(o) < today;
 
   function scheduleFor(o, target) {
     const day = target === "tomorrow" ? tomorrow : today;
@@ -1479,7 +1492,10 @@ function OpenDemandsPage({ orders, updateOrder, setEditingOrderId, setActivePage
 
   const editOrder = useCallback((id) => { setEditingOrderId(id); setActivePage("demand"); }, [setEditingOrderId, setActivePage]);
   const timerTag = o => { if (!(o.execSessions || []).length) return <span title="Iniciado antes da v1.5.0 — o cronômetro começa na próxima vez que entrar em execução" style={{ fontSize: 10, fontWeight: 700, fontFamily: FH, color: C.textDim, whiteSpace: "nowrap" }}>sem cronômetro</span>; const t = execTotals(o, shift, isWorkDay); const over = t.business > orderTotalTime(o); return <span title="Tempo de execução (expediente)" style={{ fontSize: 11, fontWeight: 800, fontFamily: FH, color: over ? C.danger : C.green, whiteSpace: "nowrap" }}>⏱ {fmtSec(t.business)}</span>; };
-  const lateTag = o => isLate(o) ? <span style={{ fontSize: 9, fontWeight: 800, fontFamily: FH, padding: "2px 6px", borderRadius: 4, background: C.danger, color: "#fff", whiteSpace: "nowrap", height: "fit-content" }}>ATRASADO {fmtDate(firstDay(o))}</span> : null;
+  const tagStyle = { fontSize: 9, fontWeight: 800, fontFamily: FH, padding: "2px 6px", borderRadius: 4, whiteSpace: "nowrap", height: "fit-content" };
+  const lateTag = o => isLate(o) ? <span title={`Entrega prevista para ${fmtDateFull(o.deliveryDate)}`} style={{ ...tagStyle, background: C.danger, color: "#fff" }}>ATRASADO · ENTREGA {fmtDate(o.deliveryDate)}</span> : null;
+  const notStartedTag = o => notStarted(o) && !isLate(o) ? <span title={`Estava programado para ${fmtDateFull(firstDay(o))} e ainda não foi iniciado`} style={{ ...tagStyle, background: C.orangeDim, color: C.orange, border: `1px solid ${C.orange}66` }}>NÃO INICIADO · {fmtDate(firstDay(o))}</span> : null;
+  const tagsFor = o => { const a = lateTag(o), b = notStartedTag(o); return a || b ? <span style={{ display: "flex", flexDirection: "column", gap: 3, alignItems: "flex-end" }}>{a}{b}</span> : null; };
   const pausingOrder = pauseReq ? orders.find(x => x.id === pauseReq.id) : null;
 
   return (
@@ -1514,9 +1530,9 @@ function OpenDemandsPage({ orders, updateOrder, setEditingOrderId, setActivePage
         <span style={{ fontSize: 13, color: C.textMuted, fontFamily: F }}>{getDayName(today)} — {fmtDateFull(today)}</span>
       </div>
       <div style={{ display: "flex", gap: 14, marginBottom: 18 }}>
-        <DropZone title="Em Execução" zone="executing" items={executingOrders} color={C.green} onDragStart={setDragItem} onDrop={handleDrop} onSelect={setSelectedExec} onEdit={editOrder} readOnly={readOnly} renderExtra={timerTag} selectedId={execOrder?.id} />
-        <DropZone title="Programado Hoje" zone="today" items={todayOrders} color={C.red} onDragStart={setDragItem} onDrop={handleDrop} onSelect={setSelectedExec} onEdit={editOrder} readOnly={readOnly} renderExtra={lateTag} />
-        <DropZone title="Programado Amanhã" zone="tomorrow" items={tomorrowOrders} color={C.steel} onDragStart={setDragItem} onDrop={handleDrop} onSelect={setSelectedExec} onEdit={editOrder} readOnly={readOnly} />
+        <DropZone title="Em Execução" zone="executing" items={executingOrders} color={C.green} onDragStart={setDragItem} onDrop={handleDrop} onSelect={setSelectedExec} onEdit={editOrder} readOnly={readOnly} renderExtra={o => <span style={{ display: "flex", flexDirection: "column", gap: 3, alignItems: "flex-end" }}>{timerTag(o)}{lateTag(o)}</span>} selectedId={execOrder?.id} />
+        <DropZone title="Programado Hoje" zone="today" items={todayOrders} color={C.red} onDragStart={setDragItem} onDrop={handleDrop} onSelect={setSelectedExec} onEdit={editOrder} readOnly={readOnly} renderExtra={tagsFor} />
+        <DropZone title="Programado Amanhã" zone="tomorrow" items={tomorrowOrders} color={C.steel} onDragStart={setDragItem} onDrop={handleDrop} onSelect={setSelectedExec} onEdit={editOrder} readOnly={readOnly} renderExtra={lateTag} />
       </div>
       {execOrder && execOrder.status === "executing" && (
         <div style={{ flex: 1, minHeight: 0, background: C.darkCard, borderRadius: 10, border: `1px solid ${C.border}`, overflow: "hidden", display: "flex", flexDirection: "column" }}>
@@ -1527,6 +1543,18 @@ function OpenDemandsPage({ orders, updateOrder, setEditingOrderId, setActivePage
               <div key={l}><div style={{ fontSize: 10, color: C.textDim, fontFamily: FH, textTransform: "uppercase", letterSpacing: "0.08em", fontWeight: 700 }}>{l}</div><div style={{ fontSize: 14, fontWeight: 800, color: c, fontFamily: FH }}>{v}</div></div>
             ))}
           </div>
+          {!readOnly && (
+            <div style={{ padding: "10px 24px", borderBottom: `1px solid ${C.border}`, display: "flex", gap: 10, alignItems: "center", background: C.dark }}>
+              {!execT.sessions || !execT.running ? (
+                <>
+                  <span style={{ fontSize: 12, color: C.yellow, fontFamily: F }}>⚠ Este pedido entrou em execução antes da atualização e está sem cronômetro.</span>
+                  <Btn variant="custom" onClick={() => startTimerOnly(execOrder.id)} style={{ padding: "6px 14px", fontSize: 12, background: C.green, color: "#fff" }}>▶ Iniciar cronômetro agora</Btn>
+                </>
+              ) : <span style={{ fontSize: 12, color: C.textMuted, fontFamily: F }}>⏱ Cronômetro rodando desde {fmtDateTime((execOrder.execSessions || [])[execOrder.execSessions.length - 1]?.start)} — conta só o horário de expediente.</span>}
+              <span style={{ marginLeft: "auto" }} />
+              <Btn variant="custom" onClick={() => setPauseReq({ id: execOrder.id, target: "today" })} style={{ padding: "6px 14px", fontSize: 12, background: C.yellowDim, color: C.yellow, border: `1px solid ${C.yellow}66` }}>⏸ Retirar da produção</Btn>
+            </div>
+          )}
           <div style={{ display: "grid", gridTemplateColumns: "2fr 3fr 1fr 1.5fr", padding: "8px 24px", borderBottom: `1px solid ${C.border}`, fontSize: 10, fontWeight: 700, color: C.textDim, fontFamily: FH, textTransform: "uppercase", letterSpacing: "0.08em" }}>
             <span>Código</span><span>Descrição</span><span>Qtd</span><span>Concluído</span>
           </div>
@@ -2468,7 +2496,8 @@ function PlanningPage({ orders, currentUser, setEditingOrderId, setActivePage, r
 // ============================================================
 // PAGE: CLIENTES (gestor) — cadastro, renomear, unificar duplicados
 // ============================================================
-function ClientsPage({ clientHistory, orders, addClient, renameClient, deleteClient }) {
+// canManage (gestor): unificar/renomear/excluir. Montador: cadastrar e consultar.
+function ClientsPage({ clientHistory, orders, addClient, renameClient, deleteClient, canManage = false }) {
   const [search, setSearch] = useState("");
   const [newName, setNewName] = useState("");
   const [renameFor, setRenameFor] = useState(null);   // { from, to }
@@ -2516,7 +2545,7 @@ function ClientsPage({ clientHistory, orders, addClient, renameClient, deleteCli
 
       <h1 style={{ margin: "0 0 24px", fontSize: 26, fontWeight: 800, color: C.text, fontFamily: FH, letterSpacing: "0.02em" }}>Clientes</h1>
 
-      {pairs.length > 0 && (
+      {canManage && pairs.length > 0 && (
         <div style={{ background: C.darkCard, borderRadius: 10, border: `1px solid ${C.yellow}40`, overflow: "hidden", marginBottom: 24 }}>
           <div style={{ padding: "14px 20px", borderBottom: `1px solid ${C.border}`, background: C.yellowDim }}>
             <span style={{ fontSize: 14, fontWeight: 800, color: C.yellow, fontFamily: FH, textTransform: "uppercase", letterSpacing: "0.06em" }}>⚠ Possíveis duplicados ({pairs.length})</span>
@@ -2536,7 +2565,7 @@ function ClientsPage({ clientHistory, orders, addClient, renameClient, deleteCli
         </div>
       )}
 
-      {unregistered.length > 0 && (
+      {canManage && unregistered.length > 0 && (
         <div style={{ background: C.darkCard, borderRadius: 10, border: `1px solid ${C.orange}40`, padding: "14px 20px", marginBottom: 24 }}>
           <div style={{ fontSize: 13, fontWeight: 800, color: C.orange, fontFamily: FH, textTransform: "uppercase", marginBottom: 8 }}>Nomes usados em pedidos mas fora do cadastro</div>
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
@@ -2578,8 +2607,8 @@ function ClientsPage({ clientHistory, orders, addClient, renameClient, deleteCli
               <span>{counts[c] || 0}</span>
               <span style={{ color: C.textMuted, fontSize: 12 }}>{lastDate[c] ? fmtDateFull(lastDate[c]) : "—"}</span>
               <div style={{ display: "flex", gap: 6 }}>
-                <button onClick={() => setRenameFor({ from: c, to: c })} style={small(C.steel)}>Renomear / Unificar</button>
-                {!counts[c] && <button onClick={() => setConfirm({ message: `Excluir o cliente "${c}" do cadastro?`, onYes: () => { setConfirm(null); deleteClient(c); }, onNo: () => setConfirm(null) })} style={small(C.danger)}>Excluir</button>}
+                {canManage && <button onClick={() => setRenameFor({ from: c, to: c })} style={small(C.steel)}>Renomear / Unificar</button>}
+                {canManage && !counts[c] && <button onClick={() => setConfirm({ message: `Excluir o cliente "${c}" do cadastro?`, onYes: () => { setConfirm(null); deleteClient(c); }, onNo: () => setConfirm(null) })} style={small(C.danger)}>Excluir</button>}
               </div>
             </div>
           ))}
@@ -3205,6 +3234,14 @@ export default function App() {
     updateOrder(id, { status: 'executing', execSessions: sessions, ...(first ? { executedAt: now, executedBy: u?.username || '' } : {}) },
       { type: first ? 'execucao_iniciada' : 'execucao_retomada', details: { parallel } });
   }
+  function startTimerOnly(id) {
+    const o = orders.find(x => x.id === id); if (!o || o.status !== 'executing') return;
+    const last = (o.execSessions || [])[(o.execSessions || []).length - 1];
+    if (last && !last.end) return;
+    const u = currentUserRef.current; const now = new Date().toISOString();
+    updateOrder(id, { execSessions: [...(o.execSessions || []), { start: now, by: u?.username || '' }], ...(o.executedAt ? {} : { executedAt: now, executedBy: u?.username || '' }) },
+      { type: 'execucao_iniciada', details: { note: 'Cronômetro iniciado em pedido que já estava em execução' } });
+  }
   function closeSession(o, endType, reason) {
     const now = new Date().toISOString(); const u = currentUserRef.current;
     const sessions = [...(o.execSessions || [])];
@@ -3216,7 +3253,7 @@ export default function App() {
     const { sessions } = closeSession(o, 'pause', reason);
     const t = execTotals({ ...o, execSessions: sessions }, shift, isWorkDay);
     updateOrder(id, { status: 'scheduled', execSessions: sessions, ...scheduleChanges },
-      { type: 'execucao_pausada', details: { reason, execBusiness: t.business, execWall: t.wall, estimated: orderTotalTime(o), ...(scheduleChanges.productionDays ? { daysBefore: effectiveDays(o), daysAfter: scheduleChanges.productionDays } : {}) } });
+      { type: 'execucao_pausada', details: { reason, ...(sessions.length ? { execBusiness: t.business, execWall: t.wall } : { note: 'Sem cronômetro (execução iniciada antes da v1.5.0)' }), estimated: orderTotalTime(o), ...(scheduleChanges.productionDays ? { daysBefore: effectiveDays(o), daysAfter: scheduleChanges.productionDays } : {}) } });
   }
   function completeOrder(id, location) {
     const o = orders.find(x => x.id === id); if (!o) return;
@@ -3224,8 +3261,9 @@ export default function App() {
     const { sessions, now } = closeSession(o, 'complete');
     const t = execTotals({ ...o, execSessions: sessions }, shift, isWorkDay);
     const pendingItems = o.items.filter(i => !o.itemsCompleted[i.code]).map(i => i.code);
-    updateOrder(id, { status: 'completed', execSessions: sessions, completedAt: now, completedBy: u?.username || '', execSeconds: t.business, execWallSeconds: t.wall },
-      { type: 'concluido', details: { location, execBusiness: t.business, execWall: t.wall, estimated: orderTotalTime(o), pauses: t.pauses, pendingItems, missing: (o.missingItems || []).filter(m => !m.delivered).map(m => `${m.code}×${m.qty}`) } });
+    const measured = sessions.length > 0; // pedido iniciado antes da v1.5.0 sem cronômetro → tempo "não medido", não zero
+    updateOrder(id, { status: 'completed', execSessions: sessions, completedAt: now, completedBy: u?.username || '', execSeconds: measured ? t.business : null, execWallSeconds: measured ? t.wall : null },
+      { type: 'concluido', details: { location, ...(measured ? { execBusiness: t.business, execWall: t.wall } : { note: 'Sem cronômetro (execução iniciada antes da v1.5.0)' }), estimated: orderTotalTime(o), pauses: t.pauses, pendingItems, missing: (o.missingItems || []).filter(m => !m.delivered).map(m => `${m.code}×${m.qty}`) } });
   }
   function cancelOrder(id, reason) {
     const o = orders.find(x => x.id === id); if (!o) return;
@@ -3441,13 +3479,13 @@ export default function App() {
           {activePage === "demand" && <DemandPage orders={orders} addOrder={addOrder} updateOrder={updateOrder} deleteOrder={currentUser.role === "gestor" ? deleteOrder : null} cancelOrder={cancelOrder} currentUser={currentUser} addItem={addItem} fetchEvents={fetchEvents} eventsVersion={eventsVersion} logistics={logistics} shift={shift} isWorkDay={isWorkDay} registeredItems={registeredItems} clientHistory={clientHistory} addClient={addClient} editingOrderId={editingOrderId} setEditingOrderId={setEditingOrderId} setActivePage={setActivePage} calendarSettings={calendarSettings} dayOverrides={dayOverrides} />}
           {activePage === "calendar" && <CalendarPage orders={orders} updateOrder={updateOrder} calendarSettings={calendarSettings} saveCalendarSettings={saveCalendarSettings} dayOverrides={dayOverrides} saveDayOverrides={saveDayOverrides} setEditingOrderId={setEditingOrderId} setActivePage={setActivePage} logistics={logistics} />}
           {activePage === "planning" && <PlanningPage orders={orders} currentUser={currentUser} setEditingOrderId={setEditingOrderId} setActivePage={setActivePage} reactivateOrder={reactivateOrder} deleteOrder={deleteOrder} fetchEvents={fetchEvents} eventsVersion={eventsVersion} logistics={logistics} shift={shift} isWorkDay={isWorkDay} />}
-          {activePage === "open" && <OpenDemandsPage orders={orders} updateOrder={updateOrder} setEditingOrderId={setEditingOrderId} setActivePage={setActivePage} logistics={logistics} saveLogistics={saveLogistics} currentUser={currentUser} startExecution={startExecution} pauseExecution={pauseExecution} completeOrder={completeOrder} shift={shift} isWorkDay={isWorkDay} />}
+          {activePage === "open" && <OpenDemandsPage orders={orders} updateOrder={updateOrder} setEditingOrderId={setEditingOrderId} setActivePage={setActivePage} logistics={logistics} saveLogistics={saveLogistics} currentUser={currentUser} startExecution={startExecution} pauseExecution={pauseExecution} completeOrder={completeOrder} startTimerOnly={startTimerOnly} shift={shift} isWorkDay={isWorkDay} />}
           {activePage === "logistics" && <LogisticsPage orders={orders} logistics={logistics} saveLogistics={saveLogistics} updateOrder={updateOrder} logEvent={logEvent} readOnly={currentUser.role === "vendedor"} />}
           {activePage === "missing" && (currentUser.role === "gestor" || currentUser.role === "montador") && <MissingItemsPage orders={orders} updateOrder={updateOrder} setEditingOrderId={setEditingOrderId} setActivePage={setActivePage} />}
           {activePage === "items" && (currentUser.role === "gestor" || currentUser.role === "montador") && <ItemsPage registeredItems={registeredItems} addItem={addItem} updateItem={updateItem} deleteItem={deleteItem} />}
           {activePage === "reports" && currentUser.role === "gestor" && <ReportsPage orders={orders} registeredItems={registeredItems} calendarSettings={calendarSettings} dayOverrides={dayOverrides} />}
           {activePage === "export" && currentUser.role === "gestor" && <ExportPage orders={orders} registeredItems={registeredItems} fetchAllEvents={fetchAllEvents} logistics={logistics} />}
-          {activePage === "clients" && currentUser.role === "gestor" && <ClientsPage clientHistory={clientHistory} orders={orders} addClient={addClient} renameClient={renameClient} deleteClient={deleteClient} />}
+          {activePage === "clients" && (currentUser.role === "gestor" || currentUser.role === "montador") && <ClientsPage clientHistory={clientHistory} orders={orders} addClient={addClient} renameClient={renameClient} deleteClient={deleteClient} canManage={currentUser.role === "gestor"} />}
           {activePage === "users" && currentUser.role === "gestor" && <UsersPage users={users} addUser={addUser} updateUser={updateUser} deleteUser={deleteUser} currentUser={currentUser} />}
         </div>
       </div>

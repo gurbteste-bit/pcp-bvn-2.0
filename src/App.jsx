@@ -84,10 +84,109 @@ function fmtDate(s) { if (!s) return ""; const [, m, d] = s.split("-"); return `
 function fmtDateFull(s) { if (!s) return ""; const [y, m, d] = s.split("-"); return `${d}/${m}/${y}`; }
 function getDayName(s) { const d = new Date(s + "T12:00:00"); return ["Domingo", "Segunda", "Terça", "Quarta", "Quinta", "Sexta", "Sábado"][d.getDay()]; }
 function getDayKey(s) { const d = new Date(s + "T12:00:00"); return ["domingo", "segunda", "terca", "quarta", "quinta", "sexta", "sabado"][d.getDay()]; }
-function getToday() { return new Date().toISOString().split("T")[0]; }
-function getTomorrow() { const d = new Date(); d.setDate(d.getDate() + 1); return d.toISOString().split("T")[0]; }
+// Data LOCAL (antes usava toISOString = UTC: após 21h em Brasília já virava "amanhã")
+function localDateStr(d) { return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`; }
+function getToday() { return localDateStr(new Date()); }
+function getTomorrow() { const d = new Date(); d.setDate(d.getDate() + 1); return localDateStr(d); }
+function fmtDateTime(iso) { if (!iso) return ""; const d = new Date(iso); if (isNaN(d)) return ""; return `${String(d.getDate()).padStart(2, "0")}/${String(d.getMonth() + 1).padStart(2, "0")}/${d.getFullYear()} ${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`; }
 function addDays(s, n) { const d = new Date(s + "T12:00:00"); d.setDate(d.getDate() + n); return d.toISOString().split("T")[0]; }
 function getMonday(s) { const d = new Date(s + "T12:00:00"); const day = d.getDay(); d.setDate(d.getDate() - day + (day === 0 ? -6 : 1)); return d.toISOString().split("T")[0]; }
+
+// ── Status ──────────────────────────────────────────────────
+const STATUS_LABEL = { planning: "Planejamento", scheduled: "Programado", executing: "Em Execução", completed: "Concluído", cancelled: "Cancelado" };
+const STATUS_COLOR = { planning: C.orange, scheduled: C.red, executing: C.yellow, completed: C.blue, cancelled: C.textDim };
+const isActiveOrder = o => o.status !== "cancelled";
+
+// ── Horas de um dia (calendário + exceções) ─────────────────
+function hoursForDay(ds, calendarSettings, dayOverrides) { if (dayOverrides && dayOverrides[ds] !== undefined) return dayOverrides[ds]; return calendarSettings[getDayKey(ds)] ?? 8; }
+function orderTotalTime(o) { return (o.items || []).reduce((s, i) => s + (i.productionTime || 0), 0); }
+function orderSecondsForDay(o, ds) {
+  if (o.productionDays && o.productionDays.length > 0) { const pd = o.productionDays.find(p => p.date === ds); return pd ? pd.minutes : 0; }
+  return o.productionStart === ds ? orderTotalTime(o) : 0;
+}
+
+// ── Turno / cronômetro em horário de expediente ─────────────
+const defaultShift = { start: "07:30", end: "17:30", lunchStart: "12:00", lunchEnd: "13:00", satStart: "07:30", satEnd: "11:30" };
+function hmToMin(hm) { const [h, m] = String(hm || "0:0").split(":").map(Number); return (h || 0) * 60 + (m || 0); }
+// Janelas de trabalho (em minutos do dia) para uma data
+function shiftWindows(ds, shift, isWorkDay) {
+  if (!isWorkDay(ds)) return [];
+  const dow = new Date(ds + "T12:00:00").getDay();
+  if (dow === 0) return [];
+  if (dow === 6) return [[hmToMin(shift.satStart), hmToMin(shift.satEnd)]];
+  const s = hmToMin(shift.start), e = hmToMin(shift.end), ls = hmToMin(shift.lunchStart), le = hmToMin(shift.lunchEnd);
+  if (ls > s && le < e && le > ls) return [[s, ls], [le, e]];
+  return [[s, e]];
+}
+// Segundos dentro do expediente entre dois instantes
+function businessSeconds(startISO, endISO, shift, isWorkDay) {
+  const a = new Date(startISO), b = new Date(endISO);
+  if (isNaN(a) || isNaN(b) || b <= a) return 0;
+  let total = 0; let ds = localDateStr(a); const last = localDateStr(b); let guard = 0;
+  while (ds <= last && guard < 800) {
+    const base = new Date(ds + "T00:00:00").getTime();
+    for (const [w0, w1] of shiftWindows(ds, shift, isWorkDay)) {
+      const lo = Math.max(a.getTime(), base + w0 * 60000), hi = Math.min(b.getTime(), base + w1 * 60000);
+      if (hi > lo) total += (hi - lo) / 1000;
+    }
+    ds = addDays(ds, 1); guard++;
+  }
+  return Math.round(total);
+}
+// Totais de execução de um pedido a partir das sessões { start, end, by, reason }
+function execTotals(o, shift, isWorkDay, nowISO) {
+  const sessions = o.execSessions || [];
+  let business = 0, wall = 0;
+  sessions.forEach(s => {
+    const end = s.end || nowISO || new Date().toISOString();
+    business += businessSeconds(s.start, end, shift, isWorkDay);
+    wall += Math.max(0, Math.round((new Date(end) - new Date(s.start)) / 1000));
+  });
+  const pauses = sessions.filter(s => s.end && s.endType === "pause").length;
+  const running = sessions.length > 0 && !sessions[sessions.length - 1].end;
+  return { business, wall, pauses, running, sessions: sessions.length };
+}
+
+// ── Distribuição da produção por dia ────────────────────────
+function normalizeDays(days) {
+  const map = {}; (days || []).forEach(d => { if (!d.date) return; map[d.date] = (map[d.date] || 0) + (d.minutes || 0); });
+  return Object.entries(map).filter(([, m]) => m > 0).map(([date, minutes]) => ({ date, minutes })).sort((a, b) => a.date.localeCompare(b.date));
+}
+function effectiveDays(o) { return o.productionDays && o.productionDays.length ? o.productionDays : (o.productionStart ? [{ date: o.productionStart, minutes: orderTotalTime(o) }] : []); }
+function daysToChanges(days) { const n = normalizeDays(days); return { productionDays: n, productionStart: n.length ? n[0].date : "", productionEnd: n.length ? n[n.length - 1].date : "" }; }
+// Move só a parcela de um dia
+function movePortion(o, fromDate, toDate) { return daysToChanges(effectiveDays(o).map(d => d.date === fromDate ? { ...d, date: toDate } : d)); }
+// Move o pedido inteiro para um único dia
+function moveWhole(o, toDate) { const total = effectiveDays(o).reduce((s, d) => s + d.minutes, 0) || orderTotalTime(o); return daysToChanges([{ date: toDate, minutes: total }]); }
+// Desloca a distribuição inteira para começar em toDate, mantendo o formato (em dias úteis)
+function shiftDistribution(o, toDate, isWorkDay) {
+  const days = normalizeDays(effectiveDays(o)); if (!days.length) return moveWhole(o, toDate);
+  const work = []; let d = toDate, guard = 0;
+  while (work.length < days.length && guard < 400) { if (isWorkDay(d)) work.push(d); d = addDays(d, 1); guard++; }
+  return daysToChanges(days.map((pd, i) => ({ date: work[i] || toDate, minutes: pd.minutes })));
+}
+function fmtDaysList(days) { return (days || []).map(d => `${fmtDate(d.date)} ${fmtSec(d.minutes)}`).join(", ") || "—"; }
+
+// ── Nomes de clientes ───────────────────────────────────────
+function normName(s) { return String(s || "").trim().replace(/\s+/g, " ").toUpperCase(); }
+function nameKey(s) { return normName(s).normalize("NFD").replace(/[̀-ͯ]/g, "").replace(/[^A-Z0-9]/g, ""); }
+function levenshtein(a, b) {
+  const m = a.length, n = b.length; if (!m) return n; if (!n) return m;
+  let prev = Array.from({ length: n + 1 }, (_, j) => j);
+  for (let i = 1; i <= m; i++) { const cur = [i]; for (let j = 1; j <= n; j++) cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1)); prev = cur; }
+  return prev[n];
+}
+// Clientes parecidos (mesmo nome sem acento/pontuação, um contém o outro, ou até 2 letras de diferença)
+function similarClients(name, list) {
+  const k = nameKey(name); if (k.length < 2) return [];
+  return list.filter(c => {
+    const ck = nameKey(c); if (!ck || c === normName(name)) return false;
+    if (ck === k) return true;
+    const [short, long] = ck.length < k.length ? [ck, k] : [k, ck];
+    if (short.length >= 3 && long.startsWith(short)) return true;
+    return Math.min(k.length, ck.length) >= 5 && levenshtein(k, ck) <= 2;
+  });
+}
 
 // ============================================================
 // SHARED UI COMPONENTS
@@ -129,7 +228,7 @@ function Modal({ open, onClose, title, children, width = 480 }) {
 function ConfirmDialog({ open, message, onYes, onNo }) {
   return (
     <Modal open={open} title="Confirmação" width={400} onClose={onNo}>
-      <p style={{ color: C.text, fontSize: 15, lineHeight: 1.6, margin: "0 0 24px", fontFamily: F }}>{message}</p>
+      <p style={{ color: C.text, fontSize: 15, lineHeight: 1.6, margin: "0 0 24px", fontFamily: F, whiteSpace: "pre-line" }}>{message}</p>
       <div style={{ display: "flex", gap: 12, justifyContent: "flex-end" }}>
         <button onClick={onNo} style={{ padding: "10px 24px", borderRadius: 6, border: `1px solid ${C.border}`, background: C.darkInput, color: C.textMuted, cursor: "pointer", fontFamily: FH, fontSize: 14, fontWeight: 600 }}>Não</button>
         <button onClick={onYes} style={{ padding: "10px 24px", borderRadius: 6, border: "none", background: C.red, color: "#fff", cursor: "pointer", fontFamily: FH, fontSize: 14, fontWeight: 700 }}>Sim</button>
@@ -144,6 +243,143 @@ function Btn({ children, onClick, variant = "primary", disabled, style: s }) {
   if (variant === "ghost") return <button onClick={onClick} disabled={disabled} style={{ ...base, background: C.darkInput, color: C.textMuted, border: `1px solid ${C.border}` }}>{children}</button>;
   if (variant === "success") return <button onClick={onClick} disabled={disabled} style={{ ...base, background: C.green, color: "#fff" }}>{children}</button>;
   return <button onClick={onClick} disabled={disabled} style={base}>{children}</button>;
+}
+
+// ============================================================
+// MOTIVO — modal com texto obrigatório (cancelar, pausar, trocar entrega, reativar)
+// ============================================================
+function ReasonModal({ open, title, message, confirmLabel = "Confirmar", confirmColor = C.red, onConfirm, onCancel }) {
+  const [reason, setReason] = useState("");
+  useEffect(() => { if (open) setReason(""); }, [open]);
+  const ok = reason.trim().length >= 3;
+  return (
+    <Modal open={open} onClose={onCancel} title={title} width={480}>
+      {message && <p style={{ color: C.text, fontSize: 14, lineHeight: 1.6, margin: "0 0 16px", fontFamily: F, whiteSpace: "pre-line" }}>{message}</p>}
+      <Field label="Motivo (obrigatório)">
+        <textarea value={reason} onChange={e => setReason(e.target.value)} rows={3} autoFocus placeholder="Explique o motivo..." style={{ ...inputStyle, resize: "vertical" }} />
+      </Field>
+      <div style={{ display: "flex", gap: 12, justifyContent: "flex-end" }}>
+        <button onClick={onCancel} style={{ padding: "10px 24px", borderRadius: 6, border: `1px solid ${C.border}`, background: C.darkInput, color: C.textMuted, cursor: "pointer", fontFamily: FH, fontSize: 14, fontWeight: 600 }}>Voltar</button>
+        <button onClick={() => ok && onConfirm(reason.trim())} disabled={!ok} style={{ padding: "10px 24px", borderRadius: 6, border: "none", background: confirmColor, color: "#fff", cursor: ok ? "pointer" : "not-allowed", opacity: ok ? 1 : 0.45, fontFamily: FH, fontSize: 14, fontWeight: 700 }}>{confirmLabel}</button>
+      </div>
+    </Modal>
+  );
+}
+
+// ============================================================
+// HISTÓRICO DO PEDIDO — eventos (tabela order_events) + marcos antigos
+// ============================================================
+const EVENT_META = {
+  criado:               { label: "Pedido cadastrado", icon: "➕", color: C.steel },
+  planejado:            { label: "Planejamento preenchido", icon: "🗂", color: C.orange },
+  editado:              { label: "Pedido alterado", icon: "✎", color: C.textMuted },
+  itens_alterados:      { label: "Itens alterados", icon: "📦", color: C.textMuted },
+  entrega_alterada:     { label: "Data de entrega alterada", icon: "📆", color: C.danger },
+  reprogramado:         { label: "Dias de produção alterados", icon: "📅", color: C.blue },
+  execucao_iniciada:    { label: "Entrou em execução", icon: "▶", color: C.green },
+  execucao_retomada:    { label: "Execução retomada", icon: "▶", color: C.green },
+  execucao_pausada:     { label: "Retirado de produção", icon: "⏸", color: C.yellow },
+  item_concluido:       { label: "Item de produção marcado", icon: "☑", color: C.textMuted },
+  concluido:            { label: "Produção concluída", icon: "✔", color: C.green },
+  faltante_adicionado:  { label: "Item faltante registrado", icon: "⚠", color: C.orange },
+  faltante_entregue:    { label: "Item faltante entregue", icon: "✓", color: C.green },
+  faltante_removido:    { label: "Item faltante removido", icon: "✕", color: C.textMuted },
+  localizacao:          { label: "Localização no estoque", icon: "📍", color: C.textMuted },
+  faturado:             { label: "Faturado", icon: "🧾", color: C.yellow },
+  expedido:             { label: "Expedido", icon: "🚚", color: C.green },
+  logistica_editada:    { label: "Logística editada", icon: "✎", color: C.textMuted },
+  cancelado:            { label: "Pedido cancelado", icon: "⛔", color: C.danger },
+  reativado:            { label: "Pedido reativado", icon: "↺", color: C.orange },
+  excluido:             { label: "Pedido excluído", icon: "🗑", color: C.danger },
+  cliente_unificado:    { label: "Cliente renomeado/unificado", icon: "👥", color: C.textMuted },
+};
+// Texto legível dos detalhes de um evento (tela e CSV)
+function describeEvent(ev) {
+  const d = ev.details || {}; const p = [];
+  if (d.reason) p.push(`Motivo: ${d.reason}`);
+  if (d.from !== undefined && d.to !== undefined && ev.type === "entrega_alterada") p.push(`${fmtDateFull(d.from)} → ${fmtDateFull(d.to)}`);
+  if (d.changes) Object.entries(d.changes).forEach(([k, [a, b]]) => p.push(`${k}: "${a ?? ""}" → "${b ?? ""}"`));
+  if (d.daysBefore || d.daysAfter) p.push(`${fmtDaysList(d.daysBefore)} → ${fmtDaysList(d.daysAfter)}${d.mode ? ` (${d.mode})` : ""}`);
+  if (d.added && d.added.length) p.push(`Adicionados: ${d.added.join(", ")}`);
+  if (d.removed && d.removed.length) p.push(`Removidos: ${d.removed.join(", ")}`);
+  if (d.qtyChanged && d.qtyChanged.length) p.push(`Alterados: ${d.qtyChanged.join(", ")}`);
+  if (d.items !== undefined && ev.type !== "item_concluido") p.push(`${d.items} itens, ${fmtSec(d.totalTime || 0)}`);
+  if (d.days) p.push(`Dias: ${fmtDaysList(d.days)}`);
+  if (ev.type === "item_concluido") p.push(`${d.code}: ${d.done ? "Sim" : "Não"}`);
+  if (d.code && ev.type.startsWith("faltante")) p.push(`${d.code} × ${d.qty}`);
+  if (d.location !== undefined) p.push(`Local: ${d.location || "—"}`);
+  if (d.carrier !== undefined) p.push(`Transportadora: ${d.carrier || "—"}`);
+  if (d.execBusiness !== undefined) p.push(`Tempo execução: ${fmtSec(d.execBusiness)} (expediente) / ${fmtSec(d.execWall)} (relógio), estimado ${fmtSec(d.estimated || 0)}`);
+  if (d.pendingItems && d.pendingItems.length) p.push(`Itens não concluídos: ${d.pendingItems.join(", ")}`);
+  if (d.parallel && d.parallel.length) p.push(`Em paralelo com: ${d.parallel.join(", ")}`);
+  if (d.status) p.push(`Status: ${STATUS_LABEL[d.status] || d.status}`);
+  if (d.fromClient) p.push(`"${d.fromClient}" → "${d.toClient}"`);
+  if (d.note) p.push(d.note);
+  return p.join(" · ");
+}
+// Marcos que existem no pedido mas não têm evento (pedidos antigos, antes da v1.5.0)
+function legacyMilestones(o, events, logistics) {
+  const has = t => events.some(e => e.type === t);
+  const out = []; const lg = (logistics || {})[String(o.id)] || {};
+  const created = o.createdAtTs || o.createdAt || (/^\d{13}$/.test(String(o.id)) ? new Date(Number(o.id)).toISOString() : null);
+  if (created && !has("criado")) out.push({ ts: created, type: "criado", user_name: o.createdBy || "", legacy: true, details: {} });
+  if (o.executedAt && !has("execucao_iniciada")) out.push({ ts: o.executedAt, type: "execucao_iniciada", user_name: o.executedBy || "", legacy: true, details: {} });
+  if (o.completedAt && !has("concluido")) out.push({ ts: o.completedAt, type: "concluido", user_name: o.completedBy || "", legacy: true, details: {} });
+  else if (!o.completedAt && lg.completionDate && !has("concluido")) out.push({ ts: lg.completionDate + "T12:00:00", type: "concluido", legacy: true, dateOnly: true, details: { location: lg.location } });
+  if (lg.invoiced && lg.invoiceDate && !has("faturado")) out.push({ ts: lg.invoiceDate + "T12:00:00", type: "faturado", legacy: true, dateOnly: true, details: { carrier: lg.carrier || lg.collectionMethod || lg.collectMethod } });
+  if (lg.collected && !has("expedido")) out.push({ ts: (lg.collectedDate || lg.invoiceDate || "") + "T12:00:00", type: "expedido", legacy: true, dateOnly: true, details: {} });
+  return out.filter(e => e.ts && !e.ts.startsWith("T"));
+}
+
+function OrderHistory({ order, fetchEvents, eventsVersion, logistics, shift, isWorkDay }) {
+  const [events, setEvents] = useState(null);
+  const [err, setErr] = useState(null);
+  useEffect(() => {
+    let alive = true;
+    fetchEvents(order.id).then(r => { if (!alive) return; setEvents(r.events); setErr(r.error); });
+    return () => { alive = false; };
+  }, [order.id, eventsVersion]);
+  if (events === null) return <div style={{ padding: 24, color: C.textDim, fontFamily: F }}>Carregando histórico...</div>;
+  const all = [...events, ...legacyMilestones(order, events, logistics)].sort((a, b) => String(a.ts).localeCompare(String(b.ts)));
+  const t = execTotals(order, shift, isWorkDay);
+  const est = orderTotalTime(order);
+  return (
+    <div>
+      {err && <div style={{ padding: "10px 14px", borderRadius: 6, background: C.yellowDim, color: C.yellow, fontSize: 12, fontFamily: F, marginBottom: 14 }}>⚠ {err}</div>}
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 10, marginBottom: 18 }}>
+        {[["Status", STATUS_LABEL[order.status] || order.status, STATUS_COLOR[order.status] || C.text],
+          ["Tempo estimado", fmtSec(est), C.text],
+          ["Execução (expediente)", t.sessions ? fmtSec(t.business) + (t.running ? " ⏱" : "") : "—", C.green],
+          ["Pausas", t.sessions ? String(t.pauses) : "—", C.yellow]].map(([l, v, c]) => (
+          <div key={l} style={{ background: C.dark, border: `1px solid ${C.border}`, borderRadius: 8, padding: "10px 14px" }}>
+            <div style={{ fontSize: 10, color: C.textDim, fontFamily: FH, textTransform: "uppercase", fontWeight: 700, letterSpacing: "0.06em" }}>{l}</div>
+            <div style={{ fontSize: 16, fontWeight: 800, color: c, fontFamily: FH }}>{v}</div>
+          </div>
+        ))}
+      </div>
+      {all.length === 0 && <div style={{ padding: 24, color: C.textDim, fontFamily: F, textAlign: "center" }}>Nenhum registro.</div>}
+      <div style={{ position: "relative", paddingLeft: 26 }}>
+        <div style={{ position: "absolute", left: 9, top: 4, bottom: 4, width: 2, background: C.border }} />
+        {all.map((ev, i) => {
+          const m = EVENT_META[ev.type] || { label: ev.type, icon: "•", color: C.textMuted };
+          const desc = describeEvent(ev);
+          return (
+            <div key={ev.id || `${ev.type}-${i}`} style={{ position: "relative", marginBottom: 14 }}>
+              <div style={{ position: "absolute", left: -26, top: 0, width: 20, height: 20, borderRadius: "50%", background: C.darkCard, border: `2px solid ${m.color}`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 10 }}>{m.icon}</div>
+              <div style={{ display: "flex", gap: 10, alignItems: "baseline", flexWrap: "wrap" }}>
+                <span style={{ fontSize: 13, fontWeight: 800, color: m.color, fontFamily: FH, letterSpacing: "0.02em" }}>{m.label}</span>
+                <span style={{ fontSize: 12, color: C.textMuted, fontFamily: F }}>{ev.dateOnly ? fmtDateFull(String(ev.ts).slice(0, 10)) : fmtDateTime(ev.ts)}</span>
+                {(ev.user_name || ev.username) && <span style={{ fontSize: 11, color: C.textDim, fontFamily: F }}>por {ev.user_name || ev.username}</span>}
+                {ev.legacy && <span style={{ fontSize: 10, color: C.textDim, fontFamily: FH, textTransform: "uppercase" }}>(registro antigo)</span>}
+                {ev.pending && <span style={{ fontSize: 10, color: C.yellow, fontFamily: FH, textTransform: "uppercase" }}>(aguardando envio)</span>}
+              </div>
+              {desc && <div style={{ fontSize: 12, color: C.text, fontFamily: F, marginTop: 3, lineHeight: 1.5 }}>{desc}</div>}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
 }
 
 // ============================================================
@@ -261,7 +497,7 @@ function LoginPage({ users, onLogin }) {
             </div>
           </div>
           <div style={{ textAlign: "center", marginTop: 12, fontSize: 10, color: C.textDim, fontFamily: F }}>
-            v1.3.0
+            v1.5.0
           </div>
         </div>
       </div>
@@ -272,16 +508,18 @@ function LoginPage({ users, onLogin }) {
 // ============================================================
 // SIDEBAR
 // ============================================================
-function Sidebar({ activePage, setActivePage, currentUser, onLogout }) {
+function Sidebar({ activePage, setActivePage, currentUser, onLogout, badges = {} }) {
   const allPages = [
     { id: "demand", icon: "📋", label: "Demanda de Produção", roles: ["gestor", "montador", "vendedor"] },
+    { id: "planning", icon: "🗂", label: "Planejamento", roles: ["gestor", "montador", "vendedor"] },
     { id: "calendar", icon: "📅", label: "Calendário", roles: ["gestor", "montador", "vendedor"] },
     { id: "open", icon: "🔄", label: "Demandas em Aberto", roles: ["gestor", "montador", "vendedor"] },
-    { id: "logistics", icon: "🚚", label: "Logística", roles: ["gestor", "montador"] },
+    { id: "logistics", icon: "🚚", label: "Logística", roles: ["gestor", "montador", "vendedor"] },
     { id: "missing", icon: "⚠", label: "Itens Faltantes", roles: ["gestor", "montador"] },
     { id: "items", icon: "📦", label: "Cadastro de Itens", roles: ["gestor", "montador"] },
     { id: "reports", icon: "📊", label: "Relatórios", roles: ["gestor"] },
     { id: "export", icon: "📤", label: "Exportação", roles: ["gestor"] },
+    { id: "clients", icon: "🏢", label: "Clientes", roles: ["gestor"] },
     { id: "users", icon: "👤", label: "Usuários", roles: ["gestor"] },
   ];
 
@@ -325,6 +563,7 @@ function Sidebar({ activePage, setActivePage, currentUser, onLogout }) {
           }}>
             <span style={{ fontSize: 16 }}>{p.icon}</span>
             {p.label}
+            {badges[p.id] > 0 && <span style={{ marginLeft: "auto", minWidth: 20, padding: "1px 7px", borderRadius: 10, background: C.orange, color: "#fff", fontSize: 11, fontWeight: 800, fontFamily: FH, textAlign: "center" }}>{badges[p.id]}</span>}
           </button>
         ))}
       </nav>
@@ -354,7 +593,7 @@ function Sidebar({ activePage, setActivePage, currentUser, onLogout }) {
 // ============================================================
 // PAGE 1: DEMANDA DE PRODUÇÃO
 // ============================================================
-function DemandPage({ orders, addOrder, updateOrder, registeredItems, clientHistory, addClient, editingOrderId, setEditingOrderId, setActivePage, calendarSettings, dayOverrides }) {
+function DemandPage({ orders, addOrder, updateOrder, deleteOrder, cancelOrder, currentUser, registeredItems, addItem, clientHistory, addClient, editingOrderId, setEditingOrderId, setActivePage, calendarSettings, dayOverrides, fetchEvents, eventsVersion, logistics, shift, isWorkDay }) {
   const isEditing = editingOrderId !== null;
   const editingOrder = isEditing ? orders.find(o => o.id === editingOrderId) : null;
   const [client, setClient] = useState(editingOrder?.client || "");
@@ -374,23 +613,44 @@ function DemandPage({ orders, addOrder, updateOrder, registeredItems, clientHist
   const [missingItems, setMissingItems] = useState(editingOrder?.missingItems ? [...editingOrder.missingItems] : []);
   const [missingCode, setMissingCode] = useState("");
   const [missingQtyInput, setMissingQtyInput] = useState("");
+  const [tab, setTab] = useState("dados");
+  const [clientModal, setClientModal] = useState(null);   // { name }
+  const [itemModal, setItemModal] = useState(null);       // { code, description, time, qty }
+  const [reasonModal, setReasonModal] = useState(null);   // { title, message, confirmLabel, color, onConfirm }
 
+  const role = currentUser?.role;
+  const canCancel = role === "gestor" || role === "montador";
+  const isCancelled = editingOrder?.status === "cancelled";
   const totalItems = demandItems.length;
   const totalUnits = demandItems.reduce((s, i) => s + i.quantity, 0);
   const totalProdTime = demandItems.reduce((s, i) => s + i.productionTime, 0);
+  const clientNorm = normName(client);
+  const clientRegistered = !!clientNorm && clientHistory.includes(clientNorm);
+  const clientUnchangedLegacy = isEditing && editingOrder && client === editingOrder.client;
 
-  useEffect(() => {
-    if (editingOrder) {
-      setClient(editingOrder.client); setOrderNumber(editingOrder.orderNumber); setDeliveryDate(editingOrder.deliveryDate);
-      setProdStart(editingOrder.productionStart); setProdEnd(editingOrder.productionEnd);
-      setDemandItems([...editingOrder.items]); setObservations(editingOrder.observations);
-      const pd = editingOrder.productionDays || [];
-      setProductionDays(pd.length ? [...pd] : []);
-      setDistMode(pd.length ? "personalizado" : "equal");
-      setMissingItems(editingOrder.missingItems ? [...editingOrder.missingItems] : []);
-    }
-  }, [editingOrderId]);
+  function loadFrom(o) {
+    setClient(o.client); setOrderNumber(o.orderNumber); setDeliveryDate(o.deliveryDate);
+    setProdStart(o.productionStart || ""); setProdEnd(o.productionEnd || "");
+    setDemandItems([...(o.items || [])]); setObservations(o.observations || "");
+    const pd = o.productionDays || [];
+    setProductionDays(pd.length ? [...pd] : []);
+    setDistMode(pd.length ? "personalizado" : "equal");
+    setMissingItems(o.missingItems ? [...o.missingItems] : []);
+  }
+  useEffect(() => { if (editingOrder) loadFrom(editingOrder); setTab("dados"); }, [editingOrderId]);
 
+  function resetForm() {
+    setEditingOrderId(null); setClient(""); setOrderNumber(""); setDeliveryDate(""); setProdStart(""); setProdEnd(""); setDemandItems([]); setObservations(""); setProductionDays([]); setDistMode("equal"); setMissingItems([]); setTab("dados");
+  }
+
+  // ── Clientes ───────────────────────────────────────────────
+  const filteredClients = clientHistory.filter(c => c.toLowerCase().includes(client.toLowerCase().trim()) && c !== client).sort();
+  async function registerClient(name) {
+    const n = await addClient(name);
+    setClient(n); setClientModal(null);
+  }
+
+  // ── Itens faltantes (peças complementares) ─────────────────
   function addMissingItem() {
     const code = missingCode.trim().toUpperCase();
     if (!code) return alert("Digite o código do item faltante.");
@@ -404,11 +664,10 @@ function DemandPage({ orders, addOrder, updateOrder, registeredItems, clientHist
   function removeMissingItem(code) { setMissingItems(missingItems.filter(m => m.code !== code)); }
   function toggleMissingDelivered(code) { setMissingItems(missingItems.map(m => m.code === code ? { ...m, delivered: !m.delivered } : m)); }
 
-  const filteredClients = clientHistory.filter(c => c.toLowerCase().includes(client.toLowerCase()) && c !== client);
   const filteredCodes = registeredItems.filter(i => i.code.toLowerCase().includes(itemCode.toLowerCase()) && i.code !== itemCode);
 
-  // ── Distribuição da produção entre dias ─────────────────────────
-  function getDayHours(ds) { if (dayOverrides[ds] !== undefined) return dayOverrides[ds]; return calendarSettings[getDayKey(ds)] ?? 8; }
+  // ── Distribuição da produção entre dias ─────────────────────
+  function getDayHours(ds) { return hoursForDay(ds, calendarSettings, dayOverrides); }
   function getWorkDaysBetween(start, end) {
     if (!start || !end || end < start) return [];
     const days = []; let d = start; let guard = 0;
@@ -417,11 +676,8 @@ function DemandPage({ orders, addOrder, updateOrder, registeredItems, clientHist
   }
   function getOtherOrdersSecondsForDay(ds) {
     return orders.reduce((sum, o) => {
-      if (isEditing && o.id === editingOrderId) return sum;
-      let secs = 0;
-      if (o.productionDays && o.productionDays.length > 0) { const pd = o.productionDays.find(p => p.date === ds); secs = pd ? pd.minutes : 0; }
-      else if (o.productionStart === ds) { secs = o.items.reduce((s, i) => s + i.productionTime, 0); }
-      return sum + secs;
+      if ((isEditing && o.id === editingOrderId) || !isActiveOrder(o)) return sum;
+      return sum + orderSecondsForDay(o, ds);
     }, 0);
   }
 
@@ -464,71 +720,285 @@ function DemandPage({ orders, addOrder, updateOrder, registeredItems, clientHist
     setProductionDays(productionDays.map((pd, i) => i === idx ? { ...pd, minutes: secs !== null ? secs : pd.minutes, _raw: raw } : pd));
   }
   const distTotal = productionDays.reduce((s, pd) => s + (pd.minutes || 0), 0);
+  // Dias em que (outros pedidos + este) passam da capacidade — só aviso, não bloqueia
+  function dayLoadPct(pd) { const h = getDayHours(pd.date); if (!pd.date || h <= 0) return null; return ((getOtherOrdersSecondsForDay(pd.date) + (pd.minutes || 0)) / (h * 3600)) * 100; }
+  const overCapacityDays = productionDays.filter(pd => { const p = dayLoadPct(pd); return p !== null && p > 100; });
 
   function handleProdStartChange(val) {
     if (deliveryDate && val > deliveryDate) {
-      setConfirm({ message: "Você deseja alterar a previsão de entrega?", onYes: () => { setProdStart(val); setDeliveryDate(val); setConfirm(null); }, onNo: () => setConfirm(null) });
+      setConfirm({ message: "O início de produção passou da previsão de entrega.\nDeseja alterar a previsão de entrega?", onYes: () => { setProdStart(val); setDeliveryDate(val); setConfirm(null); }, onNo: () => setConfirm(null) });
     } else setProdStart(val);
   }
   function handleProdEndChange(val) {
     if (deliveryDate && val > deliveryDate) {
-      setConfirm({ message: "Você deseja alterar a previsão de entrega?", onYes: () => { setProdEnd(val); setDeliveryDate(val); setConfirm(null); }, onNo: () => setConfirm(null) });
+      setConfirm({ message: "O fim de produção passou da previsão de entrega.\nDeseja alterar a previsão de entrega?", onYes: () => { setProdEnd(val); setDeliveryDate(val); setConfirm(null); }, onNo: () => setConfirm(null) });
     } else if (prodStart && val < prodStart) {
       setConfirm({ message: "Você deseja alterar o início da produção?", onYes: () => { setProdEnd(val); setProdStart(val); setConfirm(null); }, onNo: () => setConfirm(null) });
     } else setProdEnd(val);
   }
-  function addItem() {
-    const found = registeredItems.find(i => i.code === itemCode.toUpperCase());
-    if (!found) return alert("Código não encontrado no cadastro.");
+
+  // ── Itens de produção ──────────────────────────────────────
+  function pushItem(found, qty) {
+    const existing = demandItems.find(di => di.code === found.code);
+    const unit = found.productionTime;
+    if (existing) {
+      const nq = existing.quantity + qty;
+      const perUnit = existing.adjusted ? existing.productionTime / existing.quantity : unit;
+      setDemandItems(demandItems.map(di => di.code === found.code ? { ...di, quantity: nq, productionTime: Math.round(nq * perUnit), _rawTime: undefined } : di));
+    } else {
+      setDemandItems([...demandItems, { code: found.code, description: found.description, quantity: qty, productionTime: qty * unit, catalogTime: unit }]);
+    }
+  }
+  function addItemToDemand() {
+    const code = itemCode.trim().toUpperCase();
+    if (!code) return;
     const qty = parseInt(itemQty);
     if (!qty || qty < 1) return alert("Quantidade deve ser um número inteiro positivo.");
-    const existing = demandItems.find(di => di.code === found.code);
-    if (existing) { setDemandItems(demandItems.map(di => di.code === found.code ? { ...di, quantity: di.quantity + qty, productionTime: (di.quantity + qty) * found.productionTime } : di)); }
-    else { setDemandItems([...demandItems, { code: found.code, description: found.description, quantity: qty, productionTime: qty * found.productionTime }]); }
+    const found = registeredItems.find(i => i.code === code);
+    if (!found) { setItemModal({ code, description: "", time: "", qty }); return; }
+    pushItem(found, qty);
     setItemCode(""); setItemQty("");
   }
+  function confirmNewCatalogItem() {
+    const secs = parseTimeStr(itemModal.time);
+    if (!itemModal.description.trim()) return alert("Informe a descrição.");
+    if (!secs || secs < 1) return alert("Tempo inválido. Use um formato como 15m30s ou 1h23m45s.");
+    const item = { code: itemModal.code, description: itemModal.description.trim(), productionTime: secs };
+    addItem(item); pushItem(item, itemModal.qty);
+    setItemModal(null); setItemCode(""); setItemQty("");
+  }
   function removeItem(code) { setDemandItems(demandItems.filter(i => i.code !== code)); }
+  // Ajuste de tempo total da linha (o catálogo não muda)
+  function updateItemTime(code, raw) {
+    const secs = parseTimeStr(raw);
+    setDemandItems(demandItems.map(di => {
+      if (di.code !== code) return di;
+      if (secs === null || secs < 1) return { ...di, _rawTime: raw };
+      const cat = registeredItems.find(r => r.code === code);
+      const catalogTotal = (di.catalogTime || cat?.productionTime || 0) * di.quantity;
+      return { ...di, productionTime: secs, adjusted: secs !== catalogTotal, catalogTime: di.catalogTime || cat?.productionTime, _rawTime: raw };
+    }));
+  }
+  const cleanItems = items => items.map(({ _rawTime, ...rest }) => rest);
+
+  // ── Diferenças para o histórico ────────────────────────────
+  function buildEditEvents(o, next) {
+    const evs = [];
+    const changes = {};
+    if (o.client !== next.client) changes["Cliente"] = [o.client, next.client];
+    if (o.orderNumber !== next.orderNumber) changes["Pedido"] = [o.orderNumber, next.orderNumber];
+    if ((o.observations || "") !== (next.observations || "")) changes["Observações"] = [o.observations, next.observations];
+    if (Object.keys(changes).length) evs.push({ type: "editado", details: { changes } });
+    const before = Object.fromEntries((o.items || []).map(i => [i.code, i]));
+    const after = Object.fromEntries(next.items.map(i => [i.code, i]));
+    const added = next.items.filter(i => !before[i.code]).map(i => `${i.code}×${i.quantity} (${fmtSec(i.productionTime)})`);
+    const removed = (o.items || []).filter(i => !after[i.code]).map(i => `${i.code}×${i.quantity}`);
+    const qtyChanged = next.items.filter(i => before[i.code] && (before[i.code].quantity !== i.quantity || before[i.code].productionTime !== i.productionTime))
+      .map(i => `${i.code}: ${before[i.code].quantity}un/${fmtSec(before[i.code].productionTime)} → ${i.quantity}un/${fmtSec(i.productionTime)}`);
+    if (added.length || removed.length || qtyChanged.length) evs.push({ type: "itens_alterados", details: { added, removed, qtyChanged, totalTime: orderTotalTime({ items: next.items }), items: next.items.length } });
+    const db = JSON.stringify(normalizeDays(effectiveDays(o))), da = JSON.stringify(normalizeDays(next.productionDays));
+    if (o.status !== "planning" && db !== da) evs.push({ type: "reprogramado", details: { daysBefore: normalizeDays(effectiveDays(o)), daysAfter: normalizeDays(next.productionDays), mode: "edição do pedido" } });
+    const mb = Object.fromEntries((o.missingItems || []).map(m => [m.code, m]));
+    const ma = Object.fromEntries(next.missingItems.map(m => [m.code, m]));
+    next.missingItems.forEach(m => {
+      if (!mb[m.code]) evs.push({ type: "faltante_adicionado", details: { code: m.code, qty: m.qty } });
+      else if (m.delivered && !mb[m.code].delivered) evs.push({ type: "faltante_entregue", details: { code: m.code, qty: m.qty } });
+    });
+    (o.missingItems || []).forEach(m => { if (!ma[m.code]) evs.push({ type: "faltante_removido", details: { code: m.code, qty: m.qty } }); });
+    return evs;
+  }
+
+  // ── Salvar ────────────────────────────────────────────────
   function confirmOrder() {
     if (!client || !orderNumber || !deliveryDate) return alert("Preencha cliente, pedido e previsão de entrega.");
-    if (demandItems.length === 0) return alert("Adicione ao menos um item.");
-    if (!prodStart) return alert("Selecione o início de produção.");
-    if (productionDays.length === 0) return alert("Configure a distribuição da produção entre os dias.");
-    const finalDays = productionDays.map(({ date, minutes }) => ({ date, minutes })).sort((a, b) => a.date.localeCompare(b.date));
+    if (!clientRegistered && !clientUnchangedLegacy) return alert(`O cliente "${clientNorm}" não está cadastrado. Selecione da lista ou clique em "+ Cadastrar cliente".`);
+    const hasItems = demandItems.length > 0;
+    const currentStatus = editingOrder?.status;
+    if (!hasItems && isEditing && currentStatus !== "planning") return alert("Um pedido que já saiu do Planejamento precisa ter ao menos um item.");
+    if (hasItems) {
+      if (demandItems.some(i => i._rawTime !== undefined && parseTimeStr(i._rawTime) === null)) return alert("Há um tempo de item inválido. Use um formato como 15m30s ou 1h23m45s.");
+      if (!prodStart) return alert("Selecione o início de produção.");
+      if (productionDays.length === 0) return alert("Configure a distribuição da produção entre os dias.");
+    }
+    const finalDays = hasItems ? normalizeDays(productionDays) : [];
+    if (hasItems && finalDays.length === 0) return alert("A distribuição da produção está zerada.");
     const finalDistTotal = finalDays.reduce((s, pd) => s + pd.minutes, 0);
-    const mismatchWarning = finalDistTotal !== totalProdTime ? `\n\nAtenção: o total distribuído (${fmtSec(finalDistTotal)}) é diferente do tempo total dos itens (${fmtSec(totalProdTime)}).` : "";
-    const finalStart = finalDays[0].date;
-    const finalEnd = finalDays[finalDays.length - 1].date;
+    const mismatchWarning = hasItems && finalDistTotal !== totalProdTime ? `\n\nAtenção: o total distribuído (${fmtSec(finalDistTotal)}) é diferente do tempo total dos itens (${fmtSec(totalProdTime)}).` : "";
+    const goesToPlanning = !hasItems;
+    const deliveryChanged = isEditing && editingOrder && deliveryDate !== editingOrder.deliveryDate;
+
+    const doSave = (deliveryReason) => {
+      const items = cleanItems(demandItems);
+      const base = { client: clientRegistered ? clientNorm : client, orderNumber: orderNumber.trim(), deliveryDate, observations, missingItems };
+      const sched = hasItems ? daysToChanges(finalDays) : { productionDays: [], productionStart: "", productionEnd: "" };
+      if (isEditing) {
+        const cm = {}; items.forEach(i => cm[i.code] = editingOrder.itemsCompleted?.[i.code] || false);
+        const changes = { ...base, ...sched, items, itemsCompleted: cm };
+        const evs = buildEditEvents(editingOrder, { ...changes });
+        if (deliveryChanged) {
+          changes.originalDeliveryDate = editingOrder.originalDeliveryDate || editingOrder.deliveryDate;
+          evs.unshift({ type: "entrega_alterada", details: { from: editingOrder.deliveryDate, to: deliveryDate, reason: deliveryReason } });
+        }
+        if (currentStatus === "planning" && hasItems) {
+          changes.status = "scheduled"; changes.plannedAt = new Date().toISOString(); changes.plannedBy = currentUser?.username || "";
+          evs.unshift({ type: "planejado", details: { items: items.length, totalTime: orderTotalTime({ items }), days: finalDays } });
+        }
+        updateOrder(editingOrderId, changes, evs);
+      } else {
+        const cm = {}; items.forEach(i => cm[i.code] = false);
+        const u = currentUser?.username || "";
+        addOrder({ id: String(Date.now()), ...base, ...sched, items, itemsCompleted: cm, status: goesToPlanning ? "planning" : "scheduled", ...(goesToPlanning ? {} : { plannedAt: new Date().toISOString(), plannedBy: u }) });
+      }
+      resetForm(); setConfirm(null); setReasonModal(null);
+    };
+
+    const proceed = (deliveryReason) => setConfirm({
+      message: (isEditing ? "Deseja salvar as alterações?" : goesToPlanning ? "Pedido sem itens.\nEle entrará na fila de PLANEJAMENTO DE PRODUÇÃO para que o montador defina itens, tempos e dias.\n\nConfirmar?" : "Deseja concluir o pedido?") + mismatchWarning,
+      onYes: () => doSave(deliveryReason), onNo: () => setConfirm(null),
+    });
+
+    if (deliveryChanged) {
+      setReasonModal({
+        title: "Alterar data de entrega",
+        message: `A previsão de entrega do pedido #${editingOrder.orderNumber} vai mudar:\n${fmtDateFull(editingOrder.deliveryDate)}  →  ${fmtDateFull(deliveryDate)}\n\nConfirma a alteração? Explique o motivo.`,
+        confirmLabel: "Confirmar alteração", color: C.danger,
+        onConfirm: reason => { setReasonModal(null); proceed(reason); },
+      });
+    } else proceed();
+  }
+
+  function requestDelete() {
+    if (!editingOrder) return;
+    const statusMsg = editingOrder.status === "completed" ? "\n\nEste pedido já foi CONCLUÍDO — os dados de logística dele também serão apagados." : editingOrder.status === "executing" ? "\n\nEste pedido está EM EXECUÇÃO." : "";
     setConfirm({
-      message: "Deseja concluir o pedido?" + mismatchWarning,
-      onYes: () => {
-        addClient(client);
-        const cm = {}; demandItems.forEach(i => cm[i.code] = false);
-        if (isEditing) { updateOrder(editingOrderId, { client, orderNumber, deliveryDate, productionStart: finalStart, productionEnd: finalEnd, productionDays: finalDays, items: demandItems, observations, itemsCompleted: { ...editingOrder.itemsCompleted, ...cm }, missingItems }); setEditingOrderId(null); }
-        else { addOrder({ id: String(Date.now()), client, orderNumber, deliveryDate, productionStart: finalStart, productionEnd: finalEnd, productionDays: finalDays, items: demandItems, observations, status: "scheduled", itemsCompleted: cm, missingItems }); }
-        setClient(""); setOrderNumber(""); setDeliveryDate(""); setProdStart(""); setProdEnd(""); setDemandItems([]); setObservations(""); setProductionDays([]); setDistMode("equal"); setMissingItems([]); setConfirm(null);
-      }, onNo: () => setConfirm(null),
+      message: `Excluir definitivamente o pedido #${editingOrder.orderNumber} — ${editingOrder.client}?${statusMsg}\n\nO pedido some do sistema. O registro no histórico de eventos é mantido para auditoria.\nEsta ação não pode ser desfeita.`,
+      onYes: () => { const id = editingOrderId; setConfirm(null); resetForm(); deleteOrder(id); },
+      onNo: () => setConfirm(null),
     });
   }
+  function requestCancel() {
+    if (!editingOrder) return;
+    setReasonModal({
+      title: `Cancelar pedido #${editingOrder.orderNumber}`,
+      message: `${editingOrder.client} — ${STATUS_LABEL[editingOrder.status]}\n\nO pedido sai do calendário e das filas, mas continua registrado como Cancelado.${editingOrder.status === "executing" ? "\nO cronômetro de execução será encerrado." : ""}`,
+      confirmLabel: "Cancelar pedido", color: C.danger,
+      onConfirm: reason => { const id = editingOrderId; setReasonModal(null); resetForm(); cancelOrder(id, reason); },
+    });
+  }
+
+  // Pedido apagado/alterado por outro usuário enquanto estava aberto
+  useEffect(() => { if (isEditing && !editingOrder) resetForm(); }, [isEditing, editingOrder]);
+
+  const titleText = !isEditing ? "Demanda de Produção" : editingOrder?.status === "planning" ? "Planejar Demanda" : "Editar Demanda";
+  const saveLabel = !isEditing ? (demandItems.length ? "Confirmar Pedido" : "Enviar para Planejamento") : (editingOrder?.status === "planning" && demandItems.length ? "Salvar e Programar" : "Salvar Alterações");
+  const tabBtn = (id, label) => (
+    <button key={id} onClick={() => setTab(id)} style={{ padding: "9px 18px", borderRadius: "6px 6px 0 0", border: "none", borderBottom: tab === id ? `3px solid ${C.red}` : "3px solid transparent", background: "none", color: tab === id ? C.text : C.textMuted, cursor: "pointer", fontFamily: FH, fontSize: 14, fontWeight: 700, letterSpacing: "0.04em", textTransform: "uppercase" }}>{label}</button>
+  );
 
   return (
     <div style={{ padding: 32, maxWidth: 960, margin: "0 auto" }}>
       <ConfirmDialog open={!!confirm} message={confirm?.message || ""} onYes={confirm?.onYes} onNo={confirm?.onNo} />
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 28 }}>
-        <h1 style={{ margin: 0, fontSize: 26, fontWeight: 800, color: C.text, fontFamily: FH, letterSpacing: "0.02em" }}>
-          {isEditing ? "Editar Demanda" : "Demanda de Produção"}
-        </h1>
-        {isEditing && <Btn variant="ghost" onClick={() => { setEditingOrderId(null); setClient(""); setOrderNumber(""); setDeliveryDate(""); setProdStart(""); setProdEnd(""); setDemandItems([]); setObservations(""); setProductionDays([]); setDistMode("equal"); setMissingItems([]); }}>← Cancelar</Btn>}
+      <ReasonModal open={!!reasonModal} title={reasonModal?.title} message={reasonModal?.message} confirmLabel={reasonModal?.confirmLabel} confirmColor={reasonModal?.color} onConfirm={r => reasonModal?.onConfirm(r)} onCancel={() => setReasonModal(null)} />
+
+      {/* Cadastrar cliente (com alerta de nomes parecidos) */}
+      <Modal open={!!clientModal} onClose={() => setClientModal(null)} title="Cadastrar cliente" width={480}>
+        {clientModal && (() => {
+          const sim = similarClients(clientModal.name, clientHistory);
+          return (
+            <div>
+              <Field label="Nome do cliente (será salvo em maiúsculas)">
+                <input value={clientModal.name} onChange={e => setClientModal({ name: e.target.value })} style={inputStyle} autoFocus />
+              </Field>
+              <div style={{ fontSize: 12, color: C.textMuted, fontFamily: F, marginBottom: 14 }}>Será cadastrado como: <strong style={{ color: C.text }}>{normName(clientModal.name) || "—"}</strong></div>
+              {sim.length > 0 && (
+                <div style={{ padding: 14, borderRadius: 8, background: C.yellowDim, border: `1px solid ${C.yellow}40`, marginBottom: 16 }}>
+                  <div style={{ fontSize: 13, color: C.yellow, fontFamily: FH, fontWeight: 800, marginBottom: 8 }}>⚠ JÁ EXISTEM CLIENTES PARECIDOS — É ALGUM DESTES?</div>
+                  {sim.map(s => (
+                    <div key={s} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "6px 0" }}>
+                      <span style={{ color: C.text, fontWeight: 700, fontFamily: F, fontSize: 13 }}>{s}</span>
+                      <button onClick={() => { setClient(s); setClientModal(null); }} style={{ padding: "5px 12px", borderRadius: 5, border: "none", background: C.green, color: "#fff", cursor: "pointer", fontFamily: FH, fontSize: 12, fontWeight: 700 }}>Usar este</button>
+                    </div>
+                  ))}
+                </div>
+              )}
+              <div style={{ display: "flex", gap: 12, justifyContent: "flex-end" }}>
+                <Btn variant="ghost" onClick={() => setClientModal(null)}>Voltar</Btn>
+                <Btn onClick={() => normName(clientModal.name) && registerClient(clientModal.name)} disabled={!normName(clientModal.name) || clientHistory.includes(normName(clientModal.name))}>{sim.length ? "Não, cadastrar novo" : "Cadastrar"}</Btn>
+              </div>
+            </div>
+          );
+        })()}
+      </Modal>
+
+      {/* Item fora do catálogo: cadastra ali mesmo */}
+      <Modal open={!!itemModal} onClose={() => setItemModal(null)} title={`Item "${itemModal?.code || ""}" não cadastrado`} width={460}>
+        {itemModal && (
+          <div>
+            <p style={{ color: C.textMuted, fontSize: 13, fontFamily: F, marginTop: 0 }}>Cadastre o item no catálogo para usá-lo neste e nos próximos pedidos.</p>
+            <Field label="Código"><input value={itemModal.code} onChange={e => setItemModal({ ...itemModal, code: e.target.value.toUpperCase() })} style={inputStyle} /></Field>
+            <Field label="Descrição"><input value={itemModal.description} onChange={e => setItemModal({ ...itemModal, description: e.target.value })} style={inputStyle} autoFocus /></Field>
+            <Field label="Tempo de produção UNITÁRIO"><input value={itemModal.time} onChange={e => setItemModal({ ...itemModal, time: e.target.value })} placeholder="Ex: 15m30s" style={inputStyle} /></Field>
+            <div style={{ display: "flex", gap: 12, justifyContent: "flex-end" }}>
+              <Btn variant="ghost" onClick={() => setItemModal(null)}>Voltar</Btn>
+              <Btn onClick={confirmNewCatalogItem}>Cadastrar e adicionar</Btn>
+            </div>
+          </div>
+        )}
+      </Modal>
+
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: isEditing ? 10 : 28, gap: 12, flexWrap: "wrap" }}>
+        <div>
+          <h1 style={{ margin: 0, fontSize: 26, fontWeight: 800, color: C.text, fontFamily: FH, letterSpacing: "0.02em" }}>{titleText}</h1>
+          {isEditing && editingOrder && <div style={{ marginTop: 4, fontSize: 12, fontFamily: FH, fontWeight: 700, color: STATUS_COLOR[editingOrder.status], textTransform: "uppercase", letterSpacing: "0.06em" }}>#{editingOrder.orderNumber} · {STATUS_LABEL[editingOrder.status]}</div>}
+        </div>
+        {isEditing && (
+          <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+            {canCancel && editingOrder && !["cancelled", "completed"].includes(editingOrder.status) && <Btn variant="custom" onClick={requestCancel} style={{ background: C.yellowDim, color: C.yellow, border: `1px solid ${C.yellow}66` }}>⛔ Cancelar Pedido</Btn>}
+            {deleteOrder && editingOrder && <Btn variant="danger" onClick={requestDelete} style={{ background: C.dangerDim, color: C.danger, border: `1px solid ${C.danger}66` }}>🗑 Excluir</Btn>}
+            <Btn variant="ghost" onClick={resetForm}>← Voltar</Btn>
+          </div>
+        )}
       </div>
 
+      {isEditing && (
+        <div style={{ display: "flex", gap: 4, borderBottom: `1px solid ${C.border}`, marginBottom: 24 }}>
+          {tabBtn("dados", "Dados do Pedido")}{tabBtn("historico", "Histórico")}
+        </div>
+      )}
+
+      {isEditing && tab === "historico" && editingOrder && (
+        <OrderHistory order={editingOrder} fetchEvents={fetchEvents} eventsVersion={eventsVersion} logistics={logistics} shift={shift} isWorkDay={isWorkDay} />
+      )}
+
+      {isCancelled && tab === "dados" && (
+        <div style={{ padding: "14px 18px", borderRadius: 8, background: C.dangerDim, border: `1px solid ${C.danger}40`, marginBottom: 20, fontFamily: F }}>
+          <div style={{ color: C.danger, fontWeight: 800, fontFamily: FH, fontSize: 15, letterSpacing: "0.04em" }}>⛔ PEDIDO CANCELADO</div>
+          <div style={{ color: C.text, fontSize: 13, marginTop: 4 }}>Motivo: {editingOrder.cancelReason || "—"}</div>
+          <div style={{ color: C.textMuted, fontSize: 12, marginTop: 2 }}>{fmtDateTime(editingOrder.cancelledAt)} {editingOrder.cancelledBy ? `por ${editingOrder.cancelledBy}` : ""} · Para reativar, use a tela Planejamento (gestor).</div>
+        </div>
+      )}
+
+      {tab === "dados" && !isCancelled && (<>
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginBottom: 20 }}>
         <Field label="Cliente"><div style={{ position: "relative" }}>
-          <input value={client} onChange={e => { setClient(e.target.value); setShowClientSugg(true); }} onBlur={() => setTimeout(() => setShowClientSugg(false), 200)} placeholder="Nome do cliente" style={inputStyle} />
+          <input value={client} onChange={e => { setClient(e.target.value.toUpperCase()); setShowClientSugg(true); }} onFocus={() => setShowClientSugg(true)} onBlur={() => setTimeout(() => setShowClientSugg(false), 200)} placeholder="Selecione um cliente cadastrado" style={{ ...inputStyle, borderColor: client && !clientRegistered && !clientUnchangedLegacy ? C.yellow : C.border }} />
           {showClientSugg && <SuggestionDropdown items={filteredClients} onSelect={c => { setClient(c); setShowClientSugg(false); }} renderLabel={c => c} />}
+          {client && !clientRegistered && !clientUnchangedLegacy && (
+            <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 6 }}>
+              <span style={{ fontSize: 12, color: C.yellow, fontFamily: F }}>Cliente não cadastrado.</span>
+              <button onClick={() => setClientModal({ name: client })} style={{ padding: "3px 10px", borderRadius: 5, border: `1px solid ${C.yellow}66`, background: C.yellowDim, color: C.yellow, cursor: "pointer", fontFamily: FH, fontSize: 11, fontWeight: 700 }}>+ Cadastrar cliente</button>
+            </div>
+          )}
         </div></Field>
         <Field label="Pedido"><input value={orderNumber} onChange={e => setOrderNumber(e.target.value)} placeholder="Nº do pedido" style={inputStyle} /></Field>
         <Field label="Previsão de Entrega"><input type="date" value={deliveryDate} onChange={e => setDeliveryDate(e.target.value)} style={inputStyle} /></Field>
         <Field label="Início de Produção"><input type="date" value={prodStart} onChange={e => handleProdStartChange(e.target.value)} style={inputStyle} /></Field>
         <Field label="Fim de Produção"><input type="date" value={prodEnd} onChange={e => handleProdEndChange(e.target.value)} style={inputStyle} /></Field>
+        {!isEditing && (
+          <div style={{ alignSelf: "center", fontSize: 12, color: C.textMuted, fontFamily: F, lineHeight: 1.5, padding: "10px 14px", background: C.darkCard, border: `1px dashed ${C.border}`, borderRadius: 8 }}>
+            💡 Sem itens? Preencha só cliente, pedido e entrega — o pedido vai para a fila de <strong style={{ color: C.orange }}>Planejamento</strong>.
+          </div>
+        )}
       </div>
 
       {/* Add Item */}
@@ -540,8 +1010,8 @@ function DemandPage({ orders, addOrder, updateOrder, registeredItems, clientHist
             <input value={itemCode} onChange={e => { setItemCode(e.target.value.toUpperCase()); setShowCodeSugg(true); }} onBlur={() => setTimeout(() => setShowCodeSugg(false), 200)} placeholder="Ex: FLANGE-A1" style={inputStyle} />
             {showCodeSugg && <SuggestionDropdown items={filteredCodes} onSelect={i => { setItemCode(i.code); setShowCodeSugg(false); }} renderLabel={i => <><span style={{ fontWeight: 700 }}>{i.code}</span><span style={{ color: C.textMuted, marginLeft: 8 }}>{i.description}</span></>} />}
           </div>
-          <div style={{ flex: 1 }}><label style={labelStyle}>Quantidade</label><input type="number" min="1" step="1" value={itemQty} onChange={e => setItemQty(e.target.value)} placeholder="Qtd" style={inputStyle} /></div>
-          <Btn onClick={addItem} style={{ height: 42 }}>Confirmar</Btn>
+          <div style={{ flex: 1 }}><label style={labelStyle}>Quantidade</label><input type="number" min="1" step="1" value={itemQty} onChange={e => setItemQty(e.target.value)} onKeyDown={e => e.key === "Enter" && addItemToDemand()} placeholder="Qtd" style={inputStyle} /></div>
+          <Btn onClick={addItemToDemand} style={{ height: 42 }}>Confirmar</Btn>
         </div>
       </div>
 
@@ -556,19 +1026,27 @@ function DemandPage({ orders, addOrder, updateOrder, registeredItems, clientHist
           </div>
         </div>
         <div style={{ display: "grid", gridTemplateColumns: "2fr 3fr 1fr 2fr 36px", padding: "8px 20px", borderBottom: `1px solid ${C.border}`, fontSize: 10, fontWeight: 700, color: C.textDim, fontFamily: FH, textTransform: "uppercase", letterSpacing: "0.08em" }}>
-          <span>Código</span><span>Descrição</span><span>Qtd</span><span>Tempo Prod.</span><span></span>
+          <span>Código</span><span>Descrição</span><span>Qtd</span><span>Tempo total (ajustável)</span><span></span>
         </div>
-        <div style={{ maxHeight: 220, overflow: "auto" }}>
+        <div style={{ maxHeight: 260, overflow: "auto" }}>
           {demandItems.length === 0 ? <div style={{ padding: 28, textAlign: "center", color: C.textDim, fontSize: 13, fontFamily: F }}>Nenhum item adicionado</div>
-          : demandItems.map((item, idx) => (
-            <div key={idx} style={{ display: "grid", gridTemplateColumns: "2fr 3fr 1fr 2fr 36px", padding: "11px 20px", borderBottom: `1px solid ${C.border}`, fontSize: 13, color: C.text, fontFamily: F, alignItems: "center" }}>
-              <span style={{ fontWeight: 700, color: C.red }}>{item.code}</span>
-              <span>{item.description}</span>
-              <span>{item.quantity}</span>
-              <span>{fmtSec(item.productionTime)}</span>
-              <button onClick={() => removeItem(item.code)} style={{ background: "none", border: "none", color: C.danger, cursor: "pointer", fontSize: 14, padding: 0 }}>✕</button>
-            </div>
-          ))}
+          : demandItems.map((item, idx) => {
+            const cat = registeredItems.find(r => r.code === item.code);
+            const catTotal = (item.catalogTime || cat?.productionTime || 0) * item.quantity;
+            const invalid = item._rawTime !== undefined && parseTimeStr(item._rawTime) === null;
+            return (
+              <div key={idx} style={{ display: "grid", gridTemplateColumns: "2fr 3fr 1fr 2fr 36px", padding: "8px 20px", borderBottom: `1px solid ${C.border}`, fontSize: 13, color: C.text, fontFamily: F, alignItems: "center" }}>
+                <span style={{ fontWeight: 700, color: C.red }}>{item.code}</span>
+                <span>{item.description}</span>
+                <span>{item.quantity}</span>
+                <div>
+                  <input value={item._rawTime !== undefined ? item._rawTime : fmtSec(item.productionTime)} onChange={e => updateItemTime(item.code, e.target.value)} style={{ ...inputStyle, padding: "6px 10px", borderColor: invalid ? C.danger : item.adjusted ? C.yellow : C.border }} />
+                  {item.adjusted && catTotal > 0 && <div style={{ fontSize: 10, color: C.yellow, fontFamily: F, marginTop: 2 }}>Ajustado · catálogo: {fmtSec(catTotal)}</div>}
+                </div>
+                <button onClick={() => removeItem(item.code)} style={{ background: "none", border: "none", color: C.danger, cursor: "pointer", fontSize: 14, padding: 0 }}>✕</button>
+              </div>
+            );
+          })}
         </div>
       </div>
 
@@ -586,6 +1064,14 @@ function DemandPage({ orders, addOrder, updateOrder, registeredItems, clientHist
                 </button>
               ))}
             </div>
+
+            {overCapacityDays.length > 0 && (
+              <CapacityBanner>
+                <span style={{ fontWeight: 600, textTransform: "none", letterSpacing: 0, marginLeft: 8, fontFamily: F }}>
+                  em {overCapacityDays.map(pd => fmtDate(pd.date)).join(", ")} — o pedido pode ser salvo mesmo assim.
+                </span>
+              </CapacityBanner>
+            )}
 
             {distMode === "personalizado" && (
               <div style={{ marginBottom: 10 }}>
@@ -614,6 +1100,7 @@ function DemandPage({ orders, addOrder, updateOrder, registeredItems, clientHist
                   {distMode === "personalizado" && (
                     <button onClick={() => removeCustomDay(idx)} style={{ background: "none", border: "none", color: C.danger, cursor: "pointer", fontSize: 14 }}>✕</button>
                   )}
+                  {(() => { const p = dayLoadPct(pd); return p !== null && p > 100 ? <span style={{ gridColumn: "1 / -1", fontSize: 11, color: C.danger, fontWeight: 700, fontFamily: FH }}>⚠ Dia com {Math.round(p)}% da capacidade (somando outros pedidos)</span> : null; })()}
                 </div>
               ))}
             </div>
@@ -661,9 +1148,10 @@ function DemandPage({ orders, addOrder, updateOrder, registeredItems, clientHist
       </div>
 
       <Field label="Observações"><textarea value={observations} onChange={e => setObservations(e.target.value)} rows={3} placeholder="Observações..." style={{ ...inputStyle, resize: "vertical" }} /></Field>
-      <Btn onClick={confirmOrder} style={{ width: "100%", padding: 14, fontSize: 15, textTransform: "uppercase", letterSpacing: "0.06em" }}>
-        {isEditing ? "Salvar Alterações" : "Confirmar Pedido"}
+      <Btn onClick={confirmOrder} variant={!isEditing && !demandItems.length ? "custom" : "primary"} style={{ width: "100%", padding: 14, fontSize: 15, textTransform: "uppercase", letterSpacing: "0.06em", ...(!isEditing && !demandItems.length ? { background: C.orange, color: "#fff" } : {}) }}>
+        {saveLabel}
       </Btn>
+      </>)}
     </div>
   );
 }
@@ -676,44 +1164,59 @@ function CalendarPage({ orders, updateOrder, calendarSettings, saveCalendarSetti
   const [showSettings, setShowSettings] = useState(false);
   const [showDayConfig, setShowDayConfig] = useState(null);
   const [dayConfigHours, setDayConfigHours] = useState(8);
-  const [dragOrder, setDragOrder] = useState(null);
+  const [drag, setDrag] = useState(null);           // { id, from, whole }
+  const [hoverKey, setHoverKey] = useState(null);
+  const clickDetailRef = useRef(0);                  // nº de cliques do último mousedown (2 = duplo-clique + arrastar)
 
   const startDate = addDays(getMonday(getToday()), weekOffset * 7);
   const daysOfWeek = ["segunda", "terca", "quarta", "quinta", "sexta", "sabado"];
   const dayLabels = ["Segunda", "Terça", "Quarta", "Quinta", "Sexta", "Sábado"];
+  const shift = { ...defaultShift, ...(calendarSettings.shift || {}) };
 
   function getWeeks() {
     const weeks = [];
     for (let w = 0; w < 4; w++) { const week = []; for (let d = 0; d < 6; d++) week.push(addDays(startDate, w * 7 + d)); weeks.push(week); }
     return weeks;
   }
-  function getHoursForDay(ds) { if (dayOverrides[ds] !== undefined) return dayOverrides[ds]; return calendarSettings[getDayKey(ds)] ?? 8; }
-  function getOrdersForDay(ds) {
-    return orders.filter(o => {
-      if (o.productionDays && o.productionDays.length > 0) return o.productionDays.some(pd => pd.date === ds);
-      return o.productionStart === ds;
-    });
-  }
-  function getOrderMinutesForDay(o, ds) {
-    if (o.productionDays && o.productionDays.length > 0) { const pd = o.productionDays.find(p => p.date === ds); return pd ? pd.minutes : 0; }
-    return o.productionStart === ds ? o.items.reduce((s, i) => s + i.productionTime, 0) : 0;
-  }
-  function getOccupation(ds) { const h = getHoursForDay(ds); if (h === 0) return 0; const m = getOrdersForDay(ds).reduce((s, o) => s + getOrderMinutesForDay(o, ds), 0); return Math.round((m / (h * 3600)) * 100); }
+  function getHoursForDay(ds) { return hoursForDay(ds, calendarSettings, dayOverrides); }
+  const calOrders = orders.filter(o => isActiveOrder(o) && o.status !== "planning");
+  function getOrdersForDay(ds) { return calOrders.filter(o => orderSecondsForDay(o, ds) > 0 || (!(o.productionDays || []).length && o.productionStart === ds)); }
+  function getDaySeconds(ds) { return getOrdersForDay(ds).reduce((s, o) => s + orderSecondsForDay(o, ds), 0); }
+  function getOccupation(ds) { const h = getHoursForDay(ds); if (h === 0) return 0; return Math.round((getDaySeconds(ds) / (h * 3600)) * 100); }
+  // Aviso (não bloqueio): carga do dia passou da capacidade configurada
+  function isOverCapacity(ds) { const h = getHoursForDay(ds); return h > 0 && getDaySeconds(ds) > h * 3600; }
   function occColor(pct) { if (pct <= 60) return { bg: C.greenDim, text: C.green }; if (pct <= 75) return { bg: C.yellowDim, text: C.yellow }; if (pct <= 90) return { bg: C.orangeDim, text: C.orange }; return { bg: C.dangerDim, text: C.danger }; }
-  function handleDrop(ds) { if (!dragOrder) return; updateOrder(dragOrder, { productionStart: ds }); setDragOrder(null); }
 
+  function handleDrop(ds) {
+    if (!drag) return;
+    const o = orders.find(x => x.id === drag.id); const d = drag; setDrag(null);
+    if (!o) return;
+    const before = normalizeDays(effectiveDays(o));
+    const ch = d.whole ? moveWhole(o, ds) : (d.from === ds ? null : movePortion(o, d.from, ds));
+    if (!ch || JSON.stringify(ch.productionDays) === JSON.stringify(before)) return;
+    updateOrder(o.id, ch, { type: "reprogramado", details: { daysBefore: before, daysAfter: ch.productionDays, mode: d.whole ? "calendário — pedido inteiro" : `calendário — parte de ${fmtDate(d.from)}` } });
+  }
+  const openEdit = id => { setEditingOrderId(id); setActivePage("demand"); };
   const weeks = getWeeks();
+  const setShift = (k, v) => saveCalendarSettings({ ...calendarSettings, shift: { ...shift, [k]: v } });
+  const shiftHours = (() => { const w = shiftWindows("2026-01-05", shift, () => true); return w.reduce((s, [a, b]) => s + (b - a), 0) / 60; })();
 
   return (
-    <div style={{ padding: 24, height: "100vh", display: "flex", flexDirection: "column", overflow: "hidden" }}>
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 18 }}>
+    <div style={{ padding: 24, height: "100vh", display: "flex", flexDirection: "column", overflow: "hidden", boxSizing: "border-box" }}>
+      {drag && (
+        <div style={{ position: "fixed", top: 14, left: "50%", transform: "translateX(-50%)", zIndex: 1500, padding: "8px 18px", borderRadius: 20, background: drag.whole ? C.red : C.darkCard, color: "#fff", border: `1px solid ${drag.whole ? C.red : C.border}`, fontFamily: FH, fontWeight: 800, fontSize: 13, letterSpacing: "0.04em", boxShadow: "0 8px 24px rgba(0,0,0,0.5)", pointerEvents: "none" }}>
+          {drag.whole ? "⇶ MOVENDO PEDIDO INTEIRO para um único dia" : `Movendo só a parte de ${fmtDate(drag.from)} — duplo-clique e arraste para mover o pedido inteiro`}
+        </div>
+      )}
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
           <h1 style={{ margin: 0, fontSize: 26, fontWeight: 800, color: C.text, fontFamily: FH, letterSpacing: "0.02em" }}>Calendário de Produção</h1>
-          <button onClick={() => setShowSettings(true)} style={{ width: 34, height: 34, borderRadius: 6, border: `1px solid ${C.border}`, background: C.darkCard, color: C.textMuted, cursor: "pointer", fontSize: 17, display: "flex", alignItems: "center", justifyContent: "center" }}>⚙</button>
+          <button onClick={() => setShowSettings(true)} title="Configurações" style={{ width: 34, height: 34, borderRadius: 6, border: `1px solid ${C.border}`, background: C.darkCard, color: C.textMuted, cursor: "pointer", fontSize: 17, display: "flex", alignItems: "center", justifyContent: "center" }}>⚙</button>
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
           <div style={{ display: "flex", gap: 12, fontSize: 11, fontFamily: FH, fontWeight: 700, letterSpacing: "0.04em" }}>
             <span style={{ display: "flex", alignItems: "center", gap: 5 }}><span style={{ width: 10, height: 10, borderRadius: 2, background: C.redDim, border: `2px solid ${C.red}` }} /><span style={{ color: C.textMuted }}>Ativo</span></span>
+            <span style={{ display: "flex", alignItems: "center", gap: 5 }}><span style={{ width: 10, height: 10, borderRadius: 2, background: C.yellowDim, border: `2px solid ${C.yellow}` }} /><span style={{ color: C.textMuted }}>Em execução</span></span>
             <span style={{ display: "flex", alignItems: "center", gap: 5 }}><span style={{ width: 10, height: 10, borderRadius: 2, background: C.blueDim, border: `2px solid ${C.blue}` }} /><span style={{ color: C.textMuted }}>Pronto</span></span>
             <span style={{ display: "flex", alignItems: "center", gap: 5 }}><span style={{ width: 10, height: 10, borderRadius: 2, background: C.greenDim, border: `2px solid ${C.green}` }} /><span style={{ color: C.textMuted }}>Coletado</span></span>
           </div>
@@ -723,6 +1226,9 @@ function CalendarPage({ orders, updateOrder, calendarSettings, saveCalendarSetti
             <Btn variant="ghost" onClick={() => setWeekOffset(w => w + 4)}>▶</Btn>
           </div>
         </div>
+      </div>
+      <div style={{ fontSize: 11, color: C.textDim, fontFamily: F, marginBottom: 10 }}>
+        Arrastar = move só a parte daquele dia (divide a produção) · <strong style={{ color: C.textMuted }}>Duplo-clique e arrastar</strong> = move o pedido inteiro para um dia · ✎ = abrir pedido
       </div>
 
       <div style={{ flex: 1, overflow: "auto" }}>
@@ -736,7 +1242,7 @@ function CalendarPage({ orders, updateOrder, calendarSettings, saveCalendarSetti
               const isToday = ds === getToday(); const isSat = di === 5;
               const off = isSat && !calendarSettings.saturdayEnabled && dayOverrides[ds] === undefined;
               return (
-                <div key={di} onDragOver={e => { e.preventDefault(); e.currentTarget.style.boxShadow = `inset 0 0 0 2px ${C.red}`; }} onDragLeave={e => { e.currentTarget.style.boxShadow = "none"; }} onDrop={e => { e.preventDefault(); e.currentTarget.style.boxShadow = "none"; handleDrop(ds); }}
+                <div key={di} data-day={ds} onDragOver={e => { e.preventDefault(); e.currentTarget.style.boxShadow = `inset 0 0 0 2px ${drag?.whole ? C.red : C.steel}`; }} onDragLeave={e => { e.currentTarget.style.boxShadow = "none"; }} onDrop={e => { e.preventDefault(); e.currentTarget.style.boxShadow = "none"; handleDrop(ds); }}
                   style={{ background: off ? C.dark : C.darkCard, borderRadius: 8, border: `1px solid ${isToday ? C.red : C.border}`, padding: 8, minHeight: 110, opacity: off ? 0.35 : 1, transition: "all 0.12s" }}>
                   <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 5 }}>
                     <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
@@ -745,19 +1251,30 @@ function CalendarPage({ orders, updateOrder, calendarSettings, saveCalendarSetti
                     </div>
                     <button onClick={() => { setShowDayConfig(ds); setDayConfigHours(getHoursForDay(ds)); }} style={{ background: "none", border: "none", color: C.textDim, cursor: "pointer", fontSize: 13, padding: 0 }}>⋯</button>
                   </div>
+                  {!off && isOverCapacity(ds) && <CapacityBanner compact />}
                   {getOrdersForDay(ds).map(o => {
                     const logiData = (logistics || {})[String(o.id)] || {};
                     const isCollected = o.status === "completed" && logiData.collected;
                     const isCompleted = o.status === "completed" && !logiData.collected;
-                    const cardBg = isCollected ? C.greenDim : isCompleted ? C.blueDim : C.redDim;
-                    const cardBorder = isCollected ? C.green : isCompleted ? C.blue : C.red;
-                    const clientColor = isCollected ? C.green : isCompleted ? C.blue : C.red;
+                    const isExec = o.status === "executing";
+                    const cardColor = isCollected ? C.green : isCompleted ? C.blue : isExec ? C.yellow : C.red;
+                    const cardBg = isCollected ? C.greenDim : isCompleted ? C.blueDim : isExec ? C.yellowDim : C.redDim;
+                    const nDays = effectiveDays(o).length;
+                    const key = `${o.id}|${ds}`;
+                    const movable = o.status !== "completed";
                     return (
-                      <div key={o.id} draggable onDragStart={() => setDragOrder(o.id)} onDoubleClick={() => { setEditingOrderId(o.id); setActivePage("demand"); }}
-                        style={{ padding: "5px 8px", borderRadius: 5, background: cardBg, cursor: "grab", fontSize: 10, fontFamily: F, color: C.text, fontWeight: 600, borderLeft: `3px solid ${cardBorder}`, marginBottom: 3, transition: "transform 0.1s" }}
-                        onMouseEnter={e => e.currentTarget.style.transform = "scale(1.03)"} onMouseLeave={e => e.currentTarget.style.transform = "scale(1)"}>
-                        <span style={{ fontWeight: 800, color: clientColor }}>{o.client}</span>
+                      <div key={o.id} data-card={key} draggable={movable}
+                        onMouseDown={e => { clickDetailRef.current = e.detail; }}
+                        onDragStart={e => { const whole = clickDetailRef.current >= 2; setDrag({ id: o.id, from: ds, whole }); try { e.dataTransfer.effectAllowed = "move"; e.dataTransfer.setData("text/plain", key); } catch {} }}
+                        onDragEnd={() => setDrag(null)}
+                        onMouseEnter={() => setHoverKey(key)} onMouseLeave={() => setHoverKey(k => k === key ? null : k)}
+                        title={movable ? "Arraste para mover esta parte · duplo-clique e arraste para mover o pedido inteiro" : "Pedido concluído"}
+                        style={{ position: "relative", padding: "5px 22px 5px 8px", borderRadius: 5, background: cardBg, cursor: movable ? "grab" : "default", fontSize: 10, fontFamily: F, color: C.text, fontWeight: 600, borderLeft: `3px solid ${cardColor}`, marginBottom: 3, userSelect: "none" }}>
+                        <span style={{ fontWeight: 800, color: cardColor }}>{o.client}</span>
                         <span style={{ color: C.textMuted, marginLeft: 5 }}>#{o.orderNumber}</span>
+                        {nDays > 1 && <span style={{ color: C.textMuted, marginLeft: 5, fontWeight: 700 }}>· {fmtSec(orderSecondsForDay(o, ds))}</span>}
+                        <button onClick={e => { e.stopPropagation(); openEdit(o.id); }} title="Abrir pedido" data-edit={o.id}
+                          style={{ position: "absolute", right: 3, top: "50%", transform: "translateY(-50%)", background: "none", border: "none", color: C.text, cursor: "pointer", fontSize: 11, padding: "0 3px", opacity: hoverKey === key ? 1 : 0.25 }}>✎</button>
                       </div>
                     );
                   })}
@@ -768,9 +1285,10 @@ function CalendarPage({ orders, updateOrder, calendarSettings, saveCalendarSetti
         ))}
       </div>
 
-      <Modal open={showSettings} onClose={() => setShowSettings(false)} title="Configurações do Calendário">
+      <Modal open={showSettings} onClose={() => setShowSettings(false)} title="Configurações do Calendário" width={520}>
+        <div style={{ fontSize: 12, fontWeight: 800, color: C.textDim, fontFamily: FH, textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 10 }}>Capacidade (horas produtivas por dia)</div>
         {daysOfWeek.map((k, i) => (
-          <div key={k} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
+          <div key={k} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
             <span style={{ color: C.text, fontSize: 14, fontFamily: F, fontWeight: 600 }}>{dayLabels[i]}</span>
             <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
               <input type="number" min="0" max="24" value={calendarSettings[k]} onChange={e => saveCalendarSettings({ ...calendarSettings, [k]: parseInt(e.target.value) || 0 })} style={{ ...inputStyle, width: 65, textAlign: "center" }} />
@@ -778,12 +1296,26 @@ function CalendarPage({ orders, updateOrder, calendarSettings, saveCalendarSetti
             </div>
           </div>
         ))}
-        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", paddingTop: 16, borderTop: `1px solid ${C.border}` }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "14px 0", borderTop: `1px solid ${C.border}` }}>
           <span style={{ color: C.text, fontSize: 14, fontFamily: F, fontWeight: 600 }}>Sábado é dia útil?</span>
           <button onClick={() => { const v = !calendarSettings.saturdayEnabled; saveCalendarSettings({ ...calendarSettings, saturdayEnabled: v, sabado: v ? 4 : 0 }); }}
             style={{ padding: "8px 20px", borderRadius: 6, border: "none", background: calendarSettings.saturdayEnabled ? C.green : C.darkInput, color: calendarSettings.saturdayEnabled ? "#fff" : C.textMuted, cursor: "pointer", fontFamily: FH, fontSize: 13, fontWeight: 700 }}>
             {calendarSettings.saturdayEnabled ? "Sim" : "Não"}
           </button>
+        </div>
+        <div style={{ paddingTop: 14, borderTop: `1px solid ${C.border}` }}>
+          <div style={{ fontSize: 12, fontWeight: 800, color: C.textDim, fontFamily: FH, textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 4 }}>Horário do expediente (cronômetro de execução)</div>
+          <div style={{ fontSize: 12, color: C.textMuted, fontFamily: F, marginBottom: 12 }}>O tempo de execução conta só dentro destes horários, nos dias úteis do calendário. Dias com 0h não contam.</div>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 10 }}>
+            {[["start", "Início"], ["lunchStart", "Almoço início"], ["lunchEnd", "Almoço fim"], ["end", "Fim"]].map(([k, l]) => (
+              <Field key={k} label={l} style={{ marginBottom: 8 }}><input type="time" value={shift[k]} onChange={e => setShift(k, e.target.value)} style={inputStyle} /></Field>
+            ))}
+            <Field label="Sábado início" style={{ marginBottom: 0 }}><input type="time" value={shift.satStart} onChange={e => setShift("satStart", e.target.value)} style={inputStyle} /></Field>
+            <Field label="Sábado fim" style={{ marginBottom: 0 }}><input type="time" value={shift.satEnd} onChange={e => setShift("satEnd", e.target.value)} style={inputStyle} /></Field>
+          </div>
+          {Math.abs(shiftHours - (calendarSettings.segunda ?? 8)) > 0.01 && (
+            <div style={{ marginTop: 12, fontSize: 12, color: C.yellow, fontFamily: F }}>⚠ O expediente de seg–sex soma {shiftHours.toLocaleString("pt-BR")}h, mas a capacidade de segunda está em {calendarSettings.segunda}h. Isso é normal se nem todo o expediente é produtivo — só confira se é intencional.</div>
+          )}
         </div>
       </Modal>
 
@@ -798,27 +1330,39 @@ function CalendarPage({ orders, updateOrder, calendarSettings, saveCalendarSetti
   );
 }
 
+// Tarja de aviso de capacidade — informativa, nunca bloqueia agendamento
+function CapacityBanner({ compact = false, children }) {
+  return (
+    <div style={{ background: C.danger, color: "#fff", fontFamily: FH, fontWeight: 800, letterSpacing: "0.05em", textTransform: "uppercase", borderRadius: compact ? 4 : 6, padding: compact ? "2px 6px" : "8px 14px", fontSize: compact ? 9 : 12, marginBottom: compact ? 5 : 12, textAlign: compact ? "center" : "left" }}>
+      ⚠ Capacidade máxima atingida{children}
+    </div>
+  );
+}
+
 // ============================================================
 // DROP ZONE — extracted to module level to prevent remount on each drag/state change
 // ============================================================
-function DropZone({ title, zone, items, color, onDragStart, onDrop, onSelect, onEdit }) {
+function DropZone({ title, zone, items, color, onDragStart, onDrop, onSelect, onEdit, readOnly, renderExtra, selectedId }) {
   return (
-    <div onDragOver={e => { e.preventDefault(); e.currentTarget.style.borderColor = color; }} onDragLeave={e => { e.currentTarget.style.borderColor = C.border; }} onDrop={e => { e.preventDefault(); e.currentTarget.style.borderColor = C.border; onDrop(zone); }}
-      style={{ flex: 1, background: C.dark, borderRadius: 10, border: `2px dashed ${C.border}`, padding: 14, minHeight: 170, transition: "border-color 0.2s" }}>
+    <div data-zone={zone} onDragOver={e => { if (readOnly) return; e.preventDefault(); e.currentTarget.style.borderColor = color; }} onDragLeave={e => { e.currentTarget.style.borderColor = C.border; }} onDrop={e => { if (readOnly) return; e.preventDefault(); e.currentTarget.style.borderColor = C.border; onDrop(zone); }}
+      style={{ flex: 1, background: C.dark, borderRadius: 10, border: `2px dashed ${C.border}`, padding: 14, minHeight: 170, maxHeight: 300, overflow: "auto", transition: "border-color 0.2s" }}>
       <div style={{ fontSize: 12, fontWeight: 800, color, marginBottom: 10, fontFamily: FH, textTransform: "uppercase", letterSpacing: "0.06em", display: "flex", alignItems: "center", gap: 8 }}>
         <span style={{ width: 8, height: 8, borderRadius: "50%", background: color }} />{title}
         <span style={{ fontSize: 11, fontWeight: 500, color: C.textMuted, marginLeft: "auto" }}>{items.length}</span>
       </div>
       {items.map(o => (
-        <div key={o.id} draggable onDragStart={() => onDragStart(o.id)} onClick={() => zone === "executing" && onSelect(o.id)}
+        <div key={o.id} data-order={o.id} draggable={!readOnly} onDragStart={() => onDragStart(o.id)} onClick={() => zone === "executing" && onSelect(o.id)}
           onDoubleClick={() => onEdit(o.id)}
-          style={{ padding: "10px 14px", borderRadius: 8, background: C.darkCard, border: `1px solid ${C.border}`, cursor: "grab", marginBottom: 6, transition: "transform 0.1s" }}
+          style={{ padding: "10px 14px", borderRadius: 8, background: C.darkCard, border: `1px solid ${selectedId === o.id ? color : C.border}`, cursor: readOnly ? "pointer" : "grab", marginBottom: 6, transition: "transform 0.1s" }}
           onMouseEnter={e => e.currentTarget.style.transform = "translateX(3px)"} onMouseLeave={e => e.currentTarget.style.transform = "translateX(0)"}>
-          <div style={{ fontWeight: 800, color: C.text, fontSize: 13, fontFamily: F }}>{o.client}</div>
-          <div style={{ color: C.textMuted, fontSize: 11, fontFamily: F, marginTop: 2 }}>#{o.orderNumber}</div>
+          <div style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
+            <div style={{ fontWeight: 800, color: C.text, fontSize: 13, fontFamily: F }}>{o.client}</div>
+            {renderExtra && renderExtra(o)}
+          </div>
+          <div style={{ color: C.textMuted, fontSize: 11, fontFamily: F, marginTop: 2 }}>#{o.orderNumber} · {fmtSec(orderTotalTime(o))}</div>
         </div>
       ))}
-      {items.length === 0 && <div style={{ color: C.textDim, fontSize: 12, textAlign: "center", fontFamily: F, padding: 16 }}>Arraste pedidos aqui</div>}
+      {items.length === 0 && <div style={{ color: C.textDim, fontSize: 12, textAlign: "center", fontFamily: F, padding: 16 }}>{readOnly ? "Nenhum pedido" : "Arraste pedidos aqui"}</div>}
     </div>
   );
 }
@@ -826,32 +1370,67 @@ function DropZone({ title, zone, items, color, onDragStart, onDrop, onSelect, on
 // ============================================================
 // PAGE 3: DEMANDAS EM ABERTO
 // ============================================================
-function OpenDemandsPage({ orders, updateOrder, setEditingOrderId, setActivePage, logistics, saveLogistics }) {
+function OpenDemandsPage({ orders, updateOrder, setEditingOrderId, setActivePage, logistics, saveLogistics, currentUser, startExecution, pauseExecution, completeOrder, shift, isWorkDay }) {
   const today = getToday(); const tomorrow = getTomorrow();
+  const readOnly = currentUser?.role === "vendedor";
   const [selectedExec, setSelectedExec] = useState(null);
   const [dragItem, setDragItem] = useState(null);
   const [deliverModal, setDeliverModal] = useState(null); // { orderId, hasMissing, location }
   const [missingCode, setMissingCode] = useState("");
   const [missingQtyInput, setMissingQtyInput] = useState("");
+  const [confirm, setConfirm] = useState(null);
+  const [pauseReq, setPauseReq] = useState(null);         // { id, target }
+  const [, setTick] = useState(0);
+  useEffect(() => { const t = setInterval(() => setTick(x => x + 1), 30000); return () => clearInterval(t); }, []);
 
-  function isOrderForDay(o, day) {
-    if (o.productionDays && o.productionDays.length > 0) return o.productionDays.some(pd => pd.date === day);
-    return o.productionStart === day;
-  }
-  const todayOrders = orders.filter(o => isOrderForDay(o, today) && o.status !== "executing" && o.status !== "completed");
+  const firstDay = o => { const d = normalizeDays(effectiveDays(o)); return d.length ? d[0].date : ""; };
+  const hasDay = (o, day) => effectiveDays(o).some(pd => pd.date === day);
+  const scheduled = orders.filter(o => o.status === "scheduled");
+  // Hoje = programados para hoje + atrasados (dia de produção já passou e não foi iniciado)
+  const todayOrders = scheduled.filter(o => { const f = firstDay(o); return f && f <= today; }).sort((a, b) => firstDay(a).localeCompare(firstDay(b)));
   const executingOrders = orders.filter(o => o.status === "executing");
-  const tomorrowOrders = orders.filter(o => isOrderForDay(o, tomorrow) && o.status !== "executing" && o.status !== "completed");
+  const tomorrowOrders = scheduled.filter(o => !todayOrders.includes(o) && hasDay(o, tomorrow));
+  const isLate = o => o.status === "scheduled" && firstDay(o) && firstDay(o) < today;
 
-  function moveOrder(id, target) {
-    if (target === "executing") updateOrder(id, { status: "executing" });
-    else if (target === "today") updateOrder(id, { status: "scheduled", productionStart: today });
-    else if (target === "tomorrow") updateOrder(id, { status: "scheduled", productionStart: tomorrow });
+  function scheduleFor(o, target) {
+    const day = target === "tomorrow" ? tomorrow : today;
+    const f = firstDay(o);
+    if (target === "today" && f && f <= today) return {};           // já aparece em Hoje
+    if (target === "tomorrow" && f === tomorrow) return {};
+    return shiftDistribution(o, day, isWorkDay);
   }
-  function handleDrop(zone) { if (!dragItem) return; moveOrder(dragItem, zone); setDragItem(null); }
+  function handleDrop(zone) {
+    if (!dragItem || readOnly) return;
+    const o = orders.find(x => x.id === dragItem); setDragItem(null);
+    if (!o) return;
+    if (zone === "executing") {
+      if (o.status === "executing") return;
+      const others = executingOrders.filter(x => x.id !== o.id);
+      if (others.length) {
+        setConfirm({
+          message: `Já ${others.length === 1 ? "existe 1 pedido" : `existem ${others.length} pedidos`} em execução (${others.map(x => "#" + x.orderNumber).join(", ")}).\n\nOs cronômetros vão contar em paralelo, e o tempo de cada pedido ficará maior que o real de bancada.\n\nIniciar #${o.orderNumber} mesmo assim?`,
+          onYes: () => { setConfirm(null); startExecution(o.id); setSelectedExec(o.id); }, onNo: () => setConfirm(null),
+        });
+      } else { startExecution(o.id); setSelectedExec(o.id); }
+      return;
+    }
+    if (o.status === "executing") { setPauseReq({ id: o.id, target: zone }); return; }
+    const ch = scheduleFor(o, zone);
+    if (!Object.keys(ch).length) return;
+    updateOrder(o.id, ch, { type: "reprogramado", details: { daysBefore: normalizeDays(effectiveDays(o)), daysAfter: ch.productionDays, mode: `Demandas em Aberto → ${zone === "today" ? "Hoje" : "Amanhã"}` } });
+  }
+  function confirmPause(reason) {
+    const o = orders.find(x => x.id === pauseReq.id); const target = pauseReq.target; setPauseReq(null);
+    if (!o) return;
+    pauseExecution(o.id, reason, scheduleFor(o, target));
+    if (selectedExec === o.id) setSelectedExec(null);
+  }
   function toggleItem(orderId, code) {
+    if (readOnly) return;
     const order = orders.find(o => o.id === orderId);
     if (!order) return;
-    updateOrder(orderId, { itemsCompleted: { ...order.itemsCompleted, [code]: !order.itemsCompleted[code] } });
+    const done = !order.itemsCompleted[code];
+    updateOrder(orderId, { itemsCompleted: { ...order.itemsCompleted, [code]: done } }, { type: "item_concluido", details: { code, done } });
   }
   function allDone(o) { return o.items.every(i => o.itemsCompleted[i.code]); }
   function addMissingItem(orderId) {
@@ -864,16 +1443,19 @@ function OpenDemandsPage({ orders, updateOrder, setEditingOrderId, setActivePage
     const current = order.missingItems || [];
     const existing = current.find(m => m.code === code);
     const updated = existing ? current.map(m => m.code === code ? { ...m, qty: m.qty + qty } : m) : [...current, { code, qty, delivered: false }];
-    updateOrder(orderId, { missingItems: updated });
+    updateOrder(orderId, { missingItems: updated }, { type: "faltante_adicionado", details: { code, qty } });
     setMissingCode(""); setMissingQtyInput("");
   }
   function removeMissingItem(orderId, code) {
     const order = orders.find(o => o.id === orderId); if (!order) return;
-    updateOrder(orderId, { missingItems: (order.missingItems || []).filter(m => m.code !== code) });
+    const m = (order.missingItems || []).find(x => x.code === code);
+    updateOrder(orderId, { missingItems: (order.missingItems || []).filter(m => m.code !== code) }, { type: "faltante_removido", details: { code, qty: m?.qty } });
   }
   function toggleMissingDelivered(orderId, code) {
     const order = orders.find(o => o.id === orderId); if (!order) return;
-    updateOrder(orderId, { missingItems: (order.missingItems || []).map(m => m.code === code ? { ...m, delivered: !m.delivered } : m) });
+    const m = (order.missingItems || []).find(x => x.code === code);
+    updateOrder(orderId, { missingItems: (order.missingItems || []).map(m => m.code === code ? { ...m, delivered: !m.delivered } : m) },
+      m && !m.delivered ? { type: "faltante_entregue", details: { code, qty: m.qty } } : { type: "faltante_adicionado", details: { code, qty: m?.qty, note: "Marcado de volta como pendente" } });
   }
   function deliverOrder(id) {
     const order = orders.find(o => o.id === id);
@@ -883,28 +1465,35 @@ function OpenDemandsPage({ orders, updateOrder, setEditingOrderId, setActivePage
   function confirmDeliver() {
     if (!deliverModal || !deliverModal.location.trim()) return;
     const { orderId, location } = deliverModal;
-    const today = getToday();
-    updateOrder(orderId, { status: "completed" });
+    completeOrder(orderId, location.trim());
     const existing = (logistics || {})[String(orderId)] || {};
-    if (saveLogistics) saveLogistics({ ...(logistics || {}), [String(orderId)]: { ...existing, completionDate: today, location: location.trim() } });
+    if (saveLogistics) saveLogistics({ ...(logistics || {}), [String(orderId)]: { ...existing, completionDate: getToday(), location: location.trim() } });
     setSelectedExec(null);
     setDeliverModal(null);
   }
 
-  const execOrder = selectedExec ? orders.find(o => o.id === selectedExec) : (executingOrders[0] || null);
-  const totalProd = execOrder ? execOrder.items.reduce((s, i) => s + i.productionTime, 0) : 0;
+  const execOrder = (selectedExec && executingOrders.find(o => o.id === selectedExec)) || executingOrders[0] || null;
+  const totalProd = execOrder ? orderTotalTime(execOrder) : 0;
   const doneProd = execOrder ? execOrder.items.filter(i => execOrder.itemsCompleted[i.code]).reduce((s, i) => s + i.productionTime, 0) : 0;
+  const execT = execOrder ? execTotals(execOrder, shift, isWorkDay) : null;
 
   const editOrder = useCallback((id) => { setEditingOrderId(id); setActivePage("demand"); }, [setEditingOrderId, setActivePage]);
+  const timerTag = o => { if (!(o.execSessions || []).length) return <span title="Iniciado antes da v1.5.0 — o cronômetro começa na próxima vez que entrar em execução" style={{ fontSize: 10, fontWeight: 700, fontFamily: FH, color: C.textDim, whiteSpace: "nowrap" }}>sem cronômetro</span>; const t = execTotals(o, shift, isWorkDay); const over = t.business > orderTotalTime(o); return <span title="Tempo de execução (expediente)" style={{ fontSize: 11, fontWeight: 800, fontFamily: FH, color: over ? C.danger : C.green, whiteSpace: "nowrap" }}>⏱ {fmtSec(t.business)}</span>; };
+  const lateTag = o => isLate(o) ? <span style={{ fontSize: 9, fontWeight: 800, fontFamily: FH, padding: "2px 6px", borderRadius: 4, background: C.danger, color: "#fff", whiteSpace: "nowrap", height: "fit-content" }}>ATRASADO {fmtDate(firstDay(o))}</span> : null;
+  const pausingOrder = pauseReq ? orders.find(x => x.id === pauseReq.id) : null;
 
   return (
-    <div style={{ padding: 24, height: "100vh", display: "flex", flexDirection: "column", overflow: "hidden" }}>
+    <div style={{ padding: 24, height: "100vh", display: "flex", flexDirection: "column", overflow: "hidden", boxSizing: "border-box" }}>
+      <ConfirmDialog open={!!confirm} message={confirm?.message || ""} onYes={confirm?.onYes} onNo={confirm?.onNo} />
+      <ReasonModal open={!!pauseReq} title="Retirar pedido de produção?"
+        message={pausingOrder ? `#${pausingOrder.orderNumber} — ${pausingOrder.client}\nO pedido ainda não foi concluído. O cronômetro será pausado e o pedido volta para "${pauseReq.target === "tomorrow" ? "Programado Amanhã" : "Programado Hoje"}".\n\nDeseja retirar este pedido de produção? Explique o motivo.` : ""}
+        confirmLabel="Sim, retirar" color={C.yellow} onConfirm={confirmPause} onCancel={() => setPauseReq(null)} />
       <Modal open={!!deliverModal} onClose={() => setDeliverModal(null)} title="Confirmar Entrega" width={440}>
         {deliverModal && (
           <div>
             {deliverModal.hasMissing && (
               <div style={{ padding: "10px 14px", borderRadius: 6, background: C.yellowDim, color: C.yellow, fontSize: 13, fontFamily: F, marginBottom: 16, border: `1px solid ${C.yellow}30` }}>
-                ⚠ Alguns itens não foram concluídos. Eles ficarão registrados como faltantes na Logística.
+                ⚠ Alguns itens não foram concluídos. Eles ficarão registrados no histórico do pedido.
               </div>
             )}
             <Field label="Localização no estoque">
@@ -918,18 +1507,23 @@ function OpenDemandsPage({ orders, updateOrder, setEditingOrderId, setActivePage
         )}
       </Modal>
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 18 }}>
-        <h1 style={{ margin: 0, fontSize: 26, fontWeight: 800, color: C.text, fontFamily: FH, letterSpacing: "0.02em" }}>Demandas em Aberto</h1>
+        <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
+          <h1 style={{ margin: 0, fontSize: 26, fontWeight: 800, color: C.text, fontFamily: FH, letterSpacing: "0.02em" }}>Demandas em Aberto</h1>
+          {readOnly && <span style={{ fontSize: 11, fontWeight: 700, padding: "3px 10px", borderRadius: 4, background: C.darkInput, color: C.textMuted, fontFamily: FH, letterSpacing: "0.06em", textTransform: "uppercase" }}>Somente visualização</span>}
+        </div>
         <span style={{ fontSize: 13, color: C.textMuted, fontFamily: F }}>{getDayName(today)} — {fmtDateFull(today)}</span>
       </div>
       <div style={{ display: "flex", gap: 14, marginBottom: 18 }}>
-        <DropZone title="Programado Hoje" zone="today" items={todayOrders} color={C.red} onDragStart={setDragItem} onDrop={handleDrop} onSelect={setSelectedExec} onEdit={editOrder} />
-        <DropZone title="Em Execução" zone="executing" items={executingOrders} color={C.green} onDragStart={setDragItem} onDrop={handleDrop} onSelect={setSelectedExec} onEdit={editOrder} />
-        <DropZone title="Programado Amanhã" zone="tomorrow" items={tomorrowOrders} color={C.steel} onDragStart={setDragItem} onDrop={handleDrop} onSelect={setSelectedExec} onEdit={editOrder} />
+        <DropZone title="Em Execução" zone="executing" items={executingOrders} color={C.green} onDragStart={setDragItem} onDrop={handleDrop} onSelect={setSelectedExec} onEdit={editOrder} readOnly={readOnly} renderExtra={timerTag} selectedId={execOrder?.id} />
+        <DropZone title="Programado Hoje" zone="today" items={todayOrders} color={C.red} onDragStart={setDragItem} onDrop={handleDrop} onSelect={setSelectedExec} onEdit={editOrder} readOnly={readOnly} renderExtra={lateTag} />
+        <DropZone title="Programado Amanhã" zone="tomorrow" items={tomorrowOrders} color={C.steel} onDragStart={setDragItem} onDrop={handleDrop} onSelect={setSelectedExec} onEdit={editOrder} readOnly={readOnly} />
       </div>
       {execOrder && execOrder.status === "executing" && (
-        <div style={{ flex: 1, background: C.darkCard, borderRadius: 10, border: `1px solid ${C.border}`, overflow: "hidden", display: "flex", flexDirection: "column" }}>
+        <div style={{ flex: 1, minHeight: 0, background: C.darkCard, borderRadius: 10, border: `1px solid ${C.border}`, overflow: "hidden", display: "flex", flexDirection: "column" }}>
           <div style={{ padding: "14px 24px", borderBottom: `1px solid ${C.border}`, display: "flex", gap: 20, alignItems: "center", flexWrap: "wrap" }}>
-            {[["Cliente", execOrder.client, C.text], ["Pedido", "#" + execOrder.orderNumber, C.red], ["Início", fmtDateFull(execOrder.productionStart), C.text], ["Fim", fmtDateFull(execOrder.productionEnd), C.text], ["Entrega", fmtDateFull(execOrder.deliveryDate), C.text], ["Restante", fmtSec(totalProd - doneProd), C.yellow]].map(([l, v, c]) => (
+            {[["Cliente", execOrder.client, C.text], ["Pedido", "#" + execOrder.orderNumber, C.red], ["Entrega", fmtDateFull(execOrder.deliveryDate), C.text],
+              ["Estimado", fmtSec(totalProd), C.text], ["Restante (itens)", fmtSec(totalProd - doneProd), C.yellow],
+              ["Em execução", !execT.sessions ? "sem cronômetro" : fmtSec(execT.business) + (execT.pauses ? ` · ${execT.pauses} pausa${execT.pauses > 1 ? "s" : ""}` : ""), execT.business > totalProd ? C.danger : C.green]].map(([l, v, c]) => (
               <div key={l}><div style={{ fontSize: 10, color: C.textDim, fontFamily: FH, textTransform: "uppercase", letterSpacing: "0.08em", fontWeight: 700 }}>{l}</div><div style={{ fontSize: 14, fontWeight: 800, color: c, fontFamily: FH }}>{v}</div></div>
             ))}
           </div>
@@ -943,13 +1537,14 @@ function OpenDemandsPage({ orders, updateOrder, setEditingOrderId, setActivePage
                 <span>{item.description}</span>
                 <span>{item.quantity}</span>
                 <div style={{ display: "flex", gap: 6 }}>
-                  <button onClick={() => toggleItem(execOrder.id, item.code)} style={{ padding: "5px 14px", borderRadius: 5, border: "none", background: execOrder.itemsCompleted[item.code] ? C.green : C.darkInput, color: execOrder.itemsCompleted[item.code] ? "#fff" : C.textMuted, cursor: "pointer", fontFamily: FH, fontSize: 12, fontWeight: 700 }}>Sim</button>
-                  <button onClick={() => { if (execOrder.itemsCompleted[item.code]) toggleItem(execOrder.id, item.code); }} style={{ padding: "5px 14px", borderRadius: 5, border: "none", background: !execOrder.itemsCompleted[item.code] ? C.dangerDim : C.darkInput, color: !execOrder.itemsCompleted[item.code] ? C.danger : C.textMuted, cursor: "pointer", fontFamily: FH, fontSize: 12, fontWeight: 700 }}>Não</button>
+                  <button disabled={readOnly} onClick={() => { if (!execOrder.itemsCompleted[item.code]) toggleItem(execOrder.id, item.code); }} style={{ padding: "5px 14px", borderRadius: 5, border: "none", background: execOrder.itemsCompleted[item.code] ? C.green : C.darkInput, color: execOrder.itemsCompleted[item.code] ? "#fff" : C.textMuted, cursor: readOnly ? "default" : "pointer", fontFamily: FH, fontSize: 12, fontWeight: 700 }}>Sim</button>
+                  <button disabled={readOnly} onClick={() => { if (execOrder.itemsCompleted[item.code]) toggleItem(execOrder.id, item.code); }} style={{ padding: "5px 14px", borderRadius: 5, border: "none", background: !execOrder.itemsCompleted[item.code] ? C.dangerDim : C.darkInput, color: !execOrder.itemsCompleted[item.code] ? C.danger : C.textMuted, cursor: readOnly ? "default" : "pointer", fontFamily: FH, fontSize: 12, fontWeight: 700 }}>Não</button>
                 </div>
               </div>
             ))}
           </div>
 
+          {!readOnly && (<>
           {/* Itens Faltantes — peças compradas/complementares */}
           <div style={{ padding: "14px 24px", borderTop: `1px solid ${C.border}`, background: C.dark }}>
             <div style={{ fontSize: 11, fontWeight: 700, color: C.textDim, fontFamily: FH, textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 10 }}>Itens Faltantes</div>
@@ -975,11 +1570,12 @@ function OpenDemandsPage({ orders, updateOrder, setEditingOrderId, setActivePage
           </div>
 
           <div style={{ padding: "14px 24px", borderTop: `1px solid ${C.border}` }}>
-            <Btn onClick={() => deliverOrder(execOrder.id)}
+            <Btn variant="custom" onClick={() => deliverOrder(execOrder.id)}
               style={{ width: "100%", padding: 14, fontSize: 15, textTransform: "uppercase", letterSpacing: "0.06em", background: allDone(execOrder) ? C.green : C.yellow, color: "#fff" }}>
               {allDone(execOrder) ? "Entregar Demanda" : "⚠ Entregar com Faltantes"}
             </Btn>
           </div>
+          </>)}
         </div>
       )}
     </div>
@@ -1089,8 +1685,17 @@ function ReportsPage({ orders, registeredItems, calendarSettings, dayOverrides }
     return list;
   }
 
-  const filtered = filterByPeriod(orders);
+  const filtered = filterByPeriod(orders.filter(isActiveOrder));
+  const planningCount = orders.filter(o => o.status === "planning").length;
+  const cancelledCount = filterByPeriod(orders.filter(o => o.status === "cancelled")).length;
   const completed = filtered.filter(o => o.status === "completed");
+  // Tempos de execução medidos (v1.5.0+: expediente) — só pedidos concluídos com cronômetro
+  const timed = completed.filter(o => o.execSeconds !== null && o.execSeconds !== undefined && o.execSeconds > 0);
+  const timedEst = timed.reduce((s, o) => s + orderTotalTime(o), 0);
+  const timedReal = timed.reduce((s, o) => s + o.execSeconds, 0);
+  const timedEff = timedReal ? Math.round((timedEst / timedReal) * 100) : null;
+  const timedPauses = timed.reduce((s, o) => s + (o.execSessions || []).filter(x => x.endType === "pause").length, 0);
+  const worst = [...timed].map(o => ({ o, dev: o.execSeconds - orderTotalTime(o) })).sort((a, b) => b.dev - a.dev).slice(0, 5);
   const executing = filtered.filter(o => o.status === "executing");
   const scheduled = filtered.filter(o => o.status === "scheduled");
   const overdue = filtered.filter(o => o.status !== "completed" && o.deliveryDate < today);
@@ -1107,7 +1712,7 @@ function ReportsPage({ orders, registeredItems, calendarSettings, dayOverrides }
     if (o.productionDays && o.productionDays.length > 0) { const pd = o.productionDays.find(p => p.date === dt); return pd ? pd.minutes : 0; }
     return o.productionStart === dt ? o.items.reduce((s, i) => s + i.productionTime, 0) : 0;
   }
-  const occDays = []; for (let d = 0; d < 14; d++) { const dt = addDays(today, d); const dk = getDayKey(dt); const dw = new Date(dt + "T12:00:00").getDay(); if (dw === 0) continue; const h = dayOverrides[dt] !== undefined ? dayOverrides[dt] : (calendarSettings[dk] ?? 8); if (h === 0) continue; const m = orders.reduce((s, o) => s + getOrderSecondsForDay(o, dt), 0); occDays.push({ date: dt, occ: Math.round((m / (h * 3600)) * 100) }); }
+  const occDays = []; for (let d = 0; d < 14; d++) { const dt = addDays(today, d); const dk = getDayKey(dt); const dw = new Date(dt + "T12:00:00").getDay(); if (dw === 0) continue; const h = dayOverrides[dt] !== undefined ? dayOverrides[dt] : (calendarSettings[dk] ?? 8); if (h === 0) continue; const m = orders.filter(isActiveOrder).reduce((s, o) => s + getOrderSecondsForDay(o, dt), 0); occDays.push({ date: dt, occ: Math.round((m / (h * 3600)) * 100) }); }
   const avgOcc = occDays.length ? Math.round(occDays.reduce((s, d) => s + d.occ, 0) / occDays.length) : 0;
 
   return (
@@ -1141,7 +1746,7 @@ function ReportsPage({ orders, registeredItems, calendarSettings, dayOverrides }
         {/* Status */}
         <div style={{ background: C.darkCard, borderRadius: 10, border: `1px solid ${C.border}`, padding: 22 }}>
           <h3 style={{ margin: "0 0 16px", fontSize: 14, fontWeight: 800, color: C.text, fontFamily: FH, textTransform: "uppercase", letterSpacing: "0.04em" }}>Status dos Pedidos</h3>
-          {[["Programados", scheduled.length, C.red], ["Em Execução", executing.length, C.yellow], ["Concluídos", completed.length, C.green], ["Atrasados", overdue.length, C.danger]].map(([l, n, c]) => (
+          {[["Planejamento (fila)", planningCount, C.orange], ["Programados", scheduled.length, C.red], ["Em Execução", executing.length, C.yellow], ["Concluídos", completed.length, C.green], ["Atrasados", overdue.length, C.danger], ["Cancelados", cancelledCount, C.textDim]].map(([l, n, c]) => (
             <div key={l} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
               <div style={{ display: "flex", alignItems: "center", gap: 8 }}><span style={{ width: 8, height: 8, borderRadius: "50%", background: c }} /><span style={{ fontSize: 13, color: C.text, fontFamily: F }}>{l}</span></div>
               <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
@@ -1169,6 +1774,30 @@ function ReportsPage({ orders, registeredItems, calendarSettings, dayOverrides }
             );
           })}
         </div>
+      </div>
+
+      {/* Tempo estimado × real */}
+      <div style={{ background: C.darkCard, borderRadius: 10, border: `1px solid ${C.border}`, padding: 22, marginBottom: 24 }}>
+        <h3 style={{ margin: "0 0 4px", fontSize: 14, fontWeight: 800, color: C.text, fontFamily: FH, textTransform: "uppercase", letterSpacing: "0.04em" }}>Tempo de Execução — Estimado × Real</h3>
+        <div style={{ fontSize: 12, color: C.textMuted, fontFamily: F, marginBottom: 16 }}>Pedidos concluídos com cronômetro (tempo dentro do expediente). {timed.length === 0 ? "Ainda não há pedidos medidos neste período." : ""}</div>
+        {timed.length > 0 && (<>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 12, marginBottom: 16 }}>
+            {[["Pedidos medidos", timed.length, C.text], ["Estimado", fmtSec(timedEst), C.steel], ["Real", fmtSec(timedReal), C.yellow], ["Eficiência", timedEff + "%", timedEff >= 100 ? C.green : timedEff >= 80 ? C.yellow : C.danger], ["Pausas", timedPauses, C.textMuted]].map(([l, v, c]) => (
+              <div key={l} style={{ background: C.dark, borderRadius: 8, border: `1px solid ${C.border}`, padding: "10px 14px" }}>
+                <div style={{ fontSize: 10, color: C.textDim, fontFamily: FH, textTransform: "uppercase", fontWeight: 700 }}>{l}</div>
+                <div style={{ fontSize: 20, fontWeight: 900, color: c, fontFamily: FH }}>{v}</div>
+              </div>
+            ))}
+          </div>
+          <div style={{ fontSize: 11, color: C.textDim, fontFamily: F, marginBottom: 8 }}>Eficiência = estimado ÷ real. Acima de 100% = mais rápido que o estimado. Maiores desvios:</div>
+          {worst.map(({ o, dev }) => (
+            <div key={o.id} style={{ display: "grid", gridTemplateColumns: "100px 2fr 1fr 1fr 1fr", padding: "7px 0", borderTop: `1px solid ${C.border}`, fontSize: 12, color: C.text, fontFamily: F }}>
+              <span style={{ color: C.red, fontWeight: 700 }}>#{o.orderNumber}</span><span>{o.client}</span>
+              <span>Est. {fmtSec(orderTotalTime(o))}</span><span>Real {fmtSec(o.execSeconds)}</span>
+              <span style={{ color: dev > 0 ? C.danger : C.green, fontWeight: 700 }}>{dev > 0 ? "+" : "−"}{fmtSec(Math.abs(dev))}</span>
+            </div>
+          ))}
+        </>)}
       </div>
 
       {/* Rankings */}
@@ -1225,55 +1854,97 @@ function ReportsPage({ orders, registeredItems, calendarSettings, dayOverrides }
 // ============================================================
 // PAGE 6: EXPORTAÇÃO
 // ============================================================
-function ExportPage({ orders, registeredItems }) {
+function ExportPage({ orders, registeredItems, fetchAllEvents, logistics }) {
   const [exportType, setExportType] = useState("orders");
   const [format, setFormat] = useState("csv");
   const [startDate, setStartDate] = useState(""); const [endDate, setEndDate] = useState("");
   const [statusFilter, setStatusFilter] = useState("all");
   const [exportSuccess, setExportSuccess] = useState(null);
+  const [events, setEvents] = useState(null);       // histórico carregado sob demanda
+  const [eventsErr, setEventsErr] = useState(null);
+  useEffect(() => {
+    if (exportType !== "history" || events !== null) return;
+    fetchAllEvents().then(r => { setEvents(r.events); setEventsErr(r.error ? "Não foi possível carregar o histórico do servidor (a tabela order_events existe?)." : null); });
+  }, [exportType]);
 
-  function esc(v) { const s = String(v ?? ""); return (s.includes(",") || s.includes('"') || s.includes("\n")) ? '"' + s.replace(/"/g, '""') + '"' : s; }
+  // Separador ";" — padrão do Excel em português (com "," tudo caía numa coluna só)
+  const SEP = ";";
+  function esc(v) { const s = String(v ?? ""); return (s.includes(SEP) || s.includes('"') || s.includes("\n") || s.includes("\r")) ? '"' + s.replace(/"/g, '""') + '"' : s; }
+  const hrs = sec => sec === null || sec === undefined || sec === "" ? "" : (sec / 3600).toFixed(2).replace(".", ",");
+  const toCsv = rows => rows.map(r => r.map(esc).join(SEP)).join("\n");
+  const localDay = iso => iso ? localDateStr(new Date(iso)) : "";
 
   function getFiltered() {
     let r = [...orders];
     if (statusFilter !== "all") r = r.filter(o => o.status === statusFilter);
-    if (startDate) r = r.filter(o => o.productionStart >= startDate);
-    if (endDate) r = r.filter(o => o.productionStart <= endDate);
+    // Pedidos em planejamento/cancelados não têm dia de produção — usa a entrega como referência
+    const refDate = o => o.productionStart || o.deliveryDate || "";
+    if (startDate) r = r.filter(o => refDate(o) >= startDate);
+    if (endDate) r = r.filter(o => refDate(o) <= endDate);
+    return r;
+  }
+
+  function getFilteredEvents() {
+    let r = events || [];
+    if (startDate) r = r.filter(e => localDay(e.ts) >= startDate);
+    if (endDate) r = r.filter(e => localDay(e.ts) <= endDate);
     return r;
   }
 
   function genCSV() {
-    const data = exportType === "items" ? null : getFiltered();
+    const data = exportType === "items" || exportType === "history" ? null : getFiltered();
     if (exportType === "items") {
       const rows = [["Código", "Descrição", "Tempo (seg)", "Tempo"]];
       registeredItems.forEach(i => rows.push([i.code, i.description, i.productionTime, fmtSec(i.productionTime)]));
-      return rows.map(r => r.map(esc).join(",")).join("\n");
+      return toCsv(rows);
+    }
+    if (exportType === "history") {
+      const rows = [["Data", "Hora", "Data/Hora ISO", "Pedido", "Cliente", "ID Pedido", "Evento", "Código evento", "Usuário", "Motivo", "Detalhes"]];
+      getFilteredEvents().forEach(e => {
+        const d = new Date(e.ts);
+        rows.push([localDay(e.ts), isNaN(d) ? "" : d.toTimeString().slice(0, 8), e.ts, e.order_number, e.client, e.order_id, (EVENT_META[e.type] || {}).label || e.type, e.type, e.user_name || e.username || "", e.details?.reason || "", describeEvent(e)]);
+      });
+      return toCsv(rows);
     }
     if (exportType === "orders") {
-      const rows = [["Cliente", "Pedido", "Status", "Entrega", "Início", "Fim", "Itens", "Unidades", "Tempo (seg)", "Obs"]];
-      data.forEach(o => rows.push([o.client, o.orderNumber, o.status, o.deliveryDate, o.productionStart, o.productionEnd, o.items.length, o.items.reduce((s, i) => s + i.quantity, 0), o.items.reduce((s, i) => s + i.productionTime, 0), o.observations || ""]));
-      return rows.map(r => r.map(esc).join(",")).join("\n");
+      const rows = [["Cliente", "Pedido", "Status", "Entrega", "Entrega original", "Início prod.", "Fim prod.", "Dias de produção", "Itens", "Unidades", "Tempo estimado (seg)", "Tempo estimado (h)",
+        "Cadastrado em", "Cadastrado por", "Planejado em", "Planejado por", "Início execução", "Iniciado por", "Concluído em", "Concluído por",
+        "Execução expediente (seg)", "Execução expediente (h)", "Execução relógio (h)", "Pausas", "Eficiência (%)", "Horas cadastro→conclusão", "Faturado em", "Expedido",
+        "Cancelado em", "Cancelado por", "Motivo cancelamento", "Itens faltantes pendentes", "Obs"]];
+      data.forEach(o => {
+        const est = orderTotalTime(o); const lg = (logistics || {})[String(o.id)] || {};
+        const pauses = (o.execSessions || []).filter(x => x.endType === "pause").length;
+        const created = o.createdAtTs || o.createdAt;
+        const leadH = created && o.completedAt ? ((new Date(o.completedAt) - new Date(created)) / 3600000).toFixed(1).replace(".", ",") : "";
+        rows.push([o.client, o.orderNumber, STATUS_LABEL[o.status] || o.status, o.deliveryDate, o.originalDeliveryDate || "", o.productionStart, o.productionEnd, fmtDaysList(o.productionDays), o.items.length, o.items.reduce((s, i) => s + i.quantity, 0), est, hrs(est),
+          fmtDateTime(created), o.createdBy, fmtDateTime(o.plannedAt), o.plannedBy, fmtDateTime(o.executedAt), o.executedBy, fmtDateTime(o.completedAt), o.completedBy,
+          o.execSeconds ?? "", hrs(o.execSeconds), hrs(o.execWallSeconds), (o.execSessions || []).length ? pauses : "", o.execSeconds ? Math.round(est / o.execSeconds * 100) : "", leadH,
+          lg.invoiceDate ? fmtDateFull(lg.invoiceDate) : "", lg.collected ? "Sim" : "Não",
+          fmtDateTime(o.cancelledAt), o.cancelledBy, o.cancelReason, (o.missingItems || []).filter(m => !m.delivered).map(m => `${m.code}×${m.qty}`).join(", "), o.observations || ""]);
+      });
+      return toCsv(rows);
     }
     if (exportType === "order-detail") {
-      const rows = [["Cliente", "Pedido", "Status", "Código", "Descrição", "Qtd", "Tempo (seg)", "Concluído"]];
-      data.forEach(o => o.items.forEach(i => rows.push([o.client, o.orderNumber, o.status, i.code, i.description, i.quantity, i.productionTime, o.itemsCompleted?.[i.code] ? "Sim" : "Não"])));
-      return rows.map(r => r.map(esc).join(",")).join("\n");
+      const rows = [["Cliente", "Pedido", "Status", "Código", "Descrição", "Qtd", "Tempo (seg)", "Tempo catálogo unit. (seg)", "Tempo ajustado", "Concluído"]];
+      data.forEach(o => o.items.forEach(i => rows.push([o.client, o.orderNumber, STATUS_LABEL[o.status] || o.status, i.code, i.description, i.quantity, i.productionTime, i.catalogTime ?? "", i.adjusted ? "Sim" : "Não", o.itemsCompleted?.[i.code] ? "Sim" : "Não"])));
+      return toCsv(rows);
     }
     // report
-    const rows = [["RELATÓRIO DE PRODUÇÃO"], ["Gerado", new Date().toLocaleString("pt-BR")], [], ["Resumo"], ["Total Pedidos", data.length], ["Concluídos", data.filter(o => o.status === "completed").length], ["Em Execução", data.filter(o => o.status === "executing").length], ["Programados", data.filter(o => o.status === "scheduled").length], ["Unidades", data.reduce((s, o) => s + o.items.reduce((ss, i) => ss + i.quantity, 0), 0)], ["Tempo Total (seg)", data.reduce((s, o) => s + o.items.reduce((ss, i) => ss + i.productionTime, 0), 0)]];
-    return rows.map(r => r.map(esc).join(",")).join("\n");
+    const rows = [["RELATÓRIO DE PRODUÇÃO"], ["Gerado", new Date().toLocaleString("pt-BR")], [], ["Resumo"], ["Total Pedidos", data.length], ["Concluídos", data.filter(o => o.status === "completed").length], ["Em Execução", data.filter(o => o.status === "executing").length], ["Programados", data.filter(o => o.status === "scheduled").length], ["Unidades", data.reduce((s, o) => s + o.items.reduce((ss, i) => ss + i.quantity, 0), 0)], ["Tempo Total (seg)", data.reduce((s, o) => s + o.items.reduce((ss, i) => ss + i.productionTime, 0), 0)], ["Planejamento", data.filter(o => o.status === "planning").length], ["Cancelados", data.filter(o => o.status === "cancelled").length]];
+    return toCsv(rows);
   }
 
   function genJSON() {
     if (exportType === "items") return JSON.stringify(registeredItems, null, 2);
+    if (exportType === "history") return JSON.stringify(getFilteredEvents(), null, 2);
     return JSON.stringify(getFiltered().map(o => ({ ...o, totalUnits: o.items.reduce((s, i) => s + i.quantity, 0), totalMinutes: o.items.reduce((s, i) => s + i.productionTime, 0) })), null, 2);
   }
 
   function doExport() {
     const content = format === "csv" ? "\uFEFF" + genCSV() : genJSON();
     const ext = format === "csv" ? ".csv" : ".json";
-    const names = { orders: "pedidos", "order-detail": "pedidos_detalhado", items: "itens", report: "relatorio" };
-    const filename = (names[exportType] || "export") + ext;
+    const names = { orders: "pedidos", "order-detail": "pedidos_detalhado", items: "itens", report: "relatorio", history: "historico_eventos" };
+    const filename = (names[exportType] || "export") + "_" + getToday() + ext;
     const blob = new Blob([content], { type: format === "csv" ? "text/csv;charset=utf-8;" : "application/json" });
     const url = URL.createObjectURL(blob); const a = document.createElement("a"); a.href = url; a.download = filename; document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(url);
     setExportSuccess(filename); setTimeout(() => setExportSuccess(null), 4000);
@@ -1281,13 +1952,14 @@ function ExportPage({ orders, registeredItems }) {
 
   const preview = format === "csv" ? genCSV() : genJSON();
   const lines = preview.split("\n");
-  const count = exportType === "items" ? registeredItems.length : getFiltered().length;
+  const count = exportType === "items" ? registeredItems.length : exportType === "history" ? getFilteredEvents().length : getFiltered().length;
 
   const types = [
     { id: "orders", label: "Pedidos (Resumo)", desc: "Lista resumida com totais", icon: "📋" },
     { id: "order-detail", label: "Pedidos (Detalhado)", desc: "Cada item em linha separada", icon: "📑" },
     { id: "items", label: "Itens Cadastrados", desc: "Catálogo completo", icon: "📦" },
     { id: "report", label: "Relatório", desc: "Resumo gerencial", icon: "📊" },
+    { id: "history", label: "Histórico", desc: "Todos os eventos de todos os pedidos", icon: "🕘" },
   ];
 
   return (
@@ -1296,7 +1968,7 @@ function ExportPage({ orders, registeredItems }) {
 
       <div style={{ marginBottom: 24 }}>
         <label style={{ ...labelStyle, marginBottom: 10 }}>O que exportar?</label>
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 10 }}>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 10 }}>
           {types.map(t => (
             <button key={t.id} onClick={() => setExportType(t.id)} style={{ padding: 18, borderRadius: 10, cursor: "pointer", textAlign: "left", background: exportType === t.id ? C.redDim : C.darkCard, border: exportType === t.id ? `2px solid ${C.red}` : `1px solid ${C.border}`, transition: "all 0.12s" }}>
               <div style={{ fontSize: 26, marginBottom: 6 }}>{t.icon}</div>
@@ -1321,13 +1993,21 @@ function ExportPage({ orders, registeredItems }) {
         </div>
         <div style={{ background: C.darkCard, borderRadius: 10, border: `1px solid ${C.border}`, padding: 22 }}>
           <label style={{ ...labelStyle, marginBottom: 10 }}>Filtros</label>
-          {exportType !== "items" && (
+          {exportType !== "items" && exportType !== "history" && (
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10, marginBottom: 8 }}>
               <Field label="De" style={{ marginBottom: 0 }}><input type="date" value={startDate} onChange={e => setStartDate(e.target.value)} style={inputStyle} /></Field>
               <Field label="Até" style={{ marginBottom: 0 }}><input type="date" value={endDate} onChange={e => setEndDate(e.target.value)} style={inputStyle} /></Field>
-              <Field label="Status" style={{ marginBottom: 0 }}><select value={statusFilter} onChange={e => setStatusFilter(e.target.value)} style={{ ...inputStyle, cursor: "pointer" }}><option value="all">Todos</option><option value="scheduled">Programados</option><option value="executing">Em Execução</option><option value="completed">Concluídos</option></select></Field>
+              <Field label="Status" style={{ marginBottom: 0 }}><select value={statusFilter} onChange={e => setStatusFilter(e.target.value)} style={{ ...inputStyle, cursor: "pointer" }}><option value="all">Todos</option><option value="scheduled">Programados</option><option value="executing">Em Execução</option><option value="completed">Concluídos</option><option value="planning">Planejamento</option><option value="cancelled">Cancelados</option></select></Field>
             </div>
           )}
+          {exportType === "history" && (
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 8 }}>
+              <Field label="De (data do evento)" style={{ marginBottom: 0 }}><input type="date" value={startDate} onChange={e => setStartDate(e.target.value)} style={inputStyle} /></Field>
+              <Field label="Até" style={{ marginBottom: 0 }}><input type="date" value={endDate} onChange={e => setEndDate(e.target.value)} style={inputStyle} /></Field>
+            </div>
+          )}
+          {exportType === "history" && events === null && <div style={{ fontSize: 12, color: C.textMuted, fontFamily: F }}>Carregando histórico...</div>}
+          {exportType === "history" && eventsErr && <div style={{ fontSize: 12, color: C.yellow, fontFamily: F }}>⚠ {eventsErr}</div>}
           <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 14px", background: C.darkInput, borderRadius: 6, marginTop: 8 }}>
             <span style={{ fontSize: 13, color: C.textMuted, fontFamily: F }}>Registros:</span>
             <span style={{ fontSize: 18, fontWeight: 900, color: C.red, fontFamily: FH }}>{count}</span>
@@ -1362,7 +2042,8 @@ function ExportPage({ orders, registeredItems }) {
 // ============================================================
 // PAGE 7: LOGÍSTICA
 // ============================================================
-function LogisticsPage({ orders, logistics, saveLogistics, updateOrder }) {
+function LogisticsPage({ orders, logistics, saveLogistics, updateOrder, logEvent, readOnly = false }) {
+  const orderById = id => orders.find(o => o.id === id) || { id };
   const today = getToday();
   const completedOrders = orders.filter(o => o.status === "completed");
   const [confirm, setConfirm] = useState(null);
@@ -1401,7 +2082,8 @@ function LogisticsPage({ orders, logistics, saveLogistics, updateOrder }) {
   function toggleMissingDelivered(orderId, code) {
     const order = orders.find(o => o.id === orderId);
     if (!order) return;
-    updateOrder(orderId, { missingItems: (order.missingItems || []).map(m => m.code === code ? { ...m, delivered: !m.delivered } : m) });
+    const m = (order.missingItems || []).find(x => x.code === code);
+    updateOrder(orderId, { missingItems: (order.missingItems || []).map(m => m.code === code ? { ...m, delivered: !m.delivered } : m) }, { type: "faltante_entregue", details: { code, qty: m?.qty } });
   }
   const [addMissingFor, setAddMissingFor] = useState(null); // { orderId, code, qty }
   function confirmAddMissing() {
@@ -1414,7 +2096,7 @@ function LogisticsPage({ orders, logistics, saveLogistics, updateOrder }) {
     const current = order.missingItems || [];
     const existing = current.find(m => m.code === code);
     const updated = existing ? current.map(m => m.code === code ? { ...m, qty: m.qty + qty } : m) : [...current, { code, qty, delivered: false }];
-    updateOrder(addMissingFor.orderId, { missingItems: updated });
+    updateOrder(addMissingFor.orderId, { missingItems: updated }, { type: "faltante_adicionado", details: { code, qty } });
     setAddMissingFor(null);
   }
 
@@ -1430,6 +2112,7 @@ function LogisticsPage({ orders, logistics, saveLogistics, updateOrder }) {
       invoiceDate: today,
       carrier: faturarModal.carrier,
     });
+    logEvent(orderById(faturarModal.orderId), "faturado", { carrier: faturarModal.carrier });
     setFaturarModal(null);
   }
 
@@ -1441,6 +2124,7 @@ function LogisticsPage({ orders, logistics, saveLogistics, updateOrder }) {
   function confirmLocal() {
     if (!localModal) return;
     updateLogi(localModal.orderId, { location: localModal.location });
+    logEvent(orderById(localModal.orderId), "localizacao", { location: localModal.location });
     setLocalModal(null);
   }
 
@@ -1448,7 +2132,7 @@ function LogisticsPage({ orders, logistics, saveLogistics, updateOrder }) {
   function requestExpedir(o) {
     setConfirm({
       message: `Confirmar expedição do pedido #${o.orderNumber} — ${o.client}? O pedido sairá da logística e ficará verde no calendário.`,
-      onYes: () => { updateLogi(o.id, { collected: true }); setConfirm(null); },
+      onYes: () => { updateLogi(o.id, { collected: true, collectedDate: today }); logEvent(o, "expedido", {}); setConfirm(null); },
       onNo: () => setConfirm(null),
     });
   }
@@ -1460,7 +2144,12 @@ function LogisticsPage({ orders, logistics, saveLogistics, updateOrder }) {
   }
   function confirmEditar() {
     if (!editarModal) return;
+    const lg = getLogi(editarModal.orderId); const changes = {};
+    if (lg.carrier !== editarModal.carrier) changes["Transportadora"] = [lg.carrier, editarModal.carrier];
+    if (lg.location !== editarModal.location) changes["Localização"] = [lg.location, editarModal.location];
+    if (lg.invoiceDate !== editarModal.invoiceDate) changes["Data faturamento"] = [fmtDateFull(lg.invoiceDate), fmtDateFull(editarModal.invoiceDate)];
     updateLogi(editarModal.orderId, { carrier: editarModal.carrier, location: editarModal.location, invoiceDate: editarModal.invoiceDate });
+    if (Object.keys(changes).length) logEvent(orderById(editarModal.orderId), "logistica_editada", { changes });
     setEditarModal(null);
   }
 
@@ -1560,7 +2249,10 @@ function LogisticsPage({ orders, logistics, saveLogistics, updateOrder }) {
         )}
       </Modal>
 
-      <h1 style={{ margin: "0 0 28px", fontSize: 26, fontWeight: 800, color: C.text, fontFamily: FH, letterSpacing: "0.02em" }}>Logística</h1>
+      <div style={{ display: "flex", alignItems: "center", gap: 14, marginBottom: 28 }}>
+        <h1 style={{ margin: 0, fontSize: 26, fontWeight: 800, color: C.text, fontFamily: FH, letterSpacing: "0.02em" }}>Logística</h1>
+        {readOnly && <span style={{ fontSize: 11, fontWeight: 700, padding: "3px 10px", borderRadius: 4, background: C.darkInput, color: C.textMuted, fontFamily: FH, letterSpacing: "0.06em", textTransform: "uppercase" }}>Somente visualização</span>}
+      </div>
 
       {/* ── SEÇÃO 1: PRONTO COM PEÇAS FALTANTES ─────────── */}
       {withMissing.length > 0 && (
@@ -1588,7 +2280,7 @@ function LogisticsPage({ orders, logistics, saveLogistics, updateOrder }) {
                       <div style={{ fontSize: 10, color: C.textDim, fontFamily: FH, textTransform: "uppercase", fontWeight: 700, marginBottom: 2 }}>Localização</div>
                       <span style={{ color: lg.location ? C.text : C.textDim, fontSize: 12, fontFamily: F }}>{lg.location || "—"}</span>
                     </div>
-                    <button onClick={() => openLocal(o)} title="Editar localização" style={{ background: "none", border: "none", color: C.textMuted, cursor: "pointer", fontSize: 13 }}>✎</button>
+                    {readOnly ? <span /> : <button onClick={() => openLocal(o)} title="Editar localização" style={{ background: "none", border: "none", color: C.textMuted, cursor: "pointer", fontSize: 13 }}>✎</button>}
                   </div>
                   {/* itens faltantes */}
                   <div style={{ padding: "0 20px 14px 36px" }}>
@@ -1596,19 +2288,19 @@ function LogisticsPage({ orders, logistics, saveLogistics, updateOrder }) {
                       <span style={{ fontSize: 10, color: C.danger, fontFamily: FH, textTransform: "uppercase", fontWeight: 700, letterSpacing: "0.06em" }}>
                         Peças Faltantes ({missing.length})
                       </span>
-                      <button onClick={() => setAddMissingFor({ orderId: o.id, code: "", qty: "" })}
+                      {!readOnly && <button onClick={() => setAddMissingFor({ orderId: o.id, code: "", qty: "" })}
                         style={{ padding: "4px 10px", borderRadius: 5, border: `1px solid ${C.border}`, background: C.darkInput, color: C.textMuted, cursor: "pointer", fontFamily: FH, fontSize: 11, fontWeight: 700 }}>
                         + Adicionar Peça
-                      </button>
+                      </button>}
                     </div>
                     {missing.map(m => (
                       <div key={m.code} style={{ display: "flex", alignItems: "center", gap: 10, padding: "9px 14px", borderRadius: 6, background: C.dark, border: `1px solid ${C.border}`, marginBottom: 6 }}>
                         <span style={{ fontWeight: 700, color: C.red, fontFamily: FH, fontSize: 12, flex: 2 }}>{m.code}</span>
                         <span style={{ color: C.textMuted, fontFamily: F, fontSize: 12, flex: 1 }}>Qtd {m.qty}</span>
-                        <button onClick={() => toggleMissingDelivered(o.id, m.code)}
+                        {!readOnly && <button onClick={() => toggleMissingDelivered(o.id, m.code)}
                           style={{ padding: "5px 10px", borderRadius: 5, border: `1px solid ${C.green}55`, background: C.greenDim, color: C.green, cursor: "pointer", fontFamily: FH, fontSize: 11, fontWeight: 700, whiteSpace: "nowrap" }}>
                           ✓ Marcar Entregue
-                        </button>
+                        </button>}
                       </div>
                     ))}
                   </div>
@@ -1636,13 +2328,13 @@ function LogisticsPage({ orders, logistics, saveLogistics, updateOrder }) {
                   <span style={{ color: C.textMuted, fontSize: 12 }}>{lg.completionDate ? fmtDateFull(lg.completionDate) : "—"}</span>
                   <span style={{ color: C.textMuted, fontSize: 12 }}>{fmtDateFull(o.deliveryDate)}</span>
                   <span style={{ color: lg.location ? C.text : C.textDim, fontSize: 12 }}>{lg.location || "—"}</span>
-                  <div style={{ display: "flex", gap: 6 }}>
+                  {readOnly ? <span /> : <div style={{ display: "flex", gap: 6 }}>
                     <button onClick={() => openFaturar(o)}
                       style={{ padding: "5px 14px", borderRadius: 5, border: `1px solid ${C.yellow}55`, background: C.yellowDim, color: C.yellow, cursor: "pointer", fontFamily: FH, fontSize: 11, fontWeight: 700 }}>
                       Faturar
                     </button>
                     <button onClick={() => openLocal(o)} title="Editar localização" style={{ background: "none", border: "none", color: C.textMuted, cursor: "pointer", fontSize: 13 }}>✎</button>
-                  </div>
+                  </div>}
                 </div>
               );
             })}
@@ -1669,17 +2361,228 @@ function LogisticsPage({ orders, logistics, saveLogistics, updateOrder }) {
                 <span style={{ color: lg.carrier ? C.text : C.textDim, fontSize: 12 }}>{lg.carrier || "—"}</span>
                 <span style={{ color: lg.location ? C.text : C.textDim, fontSize: 12 }}>{lg.location || "—"}</span>
                 <span style={{ color: C.textMuted, fontSize: 12 }}>{lg.invoiceDate ? fmtDateFull(lg.invoiceDate) : "—"}</span>
-                <button onClick={() => requestExpedir(o)}
+                {readOnly ? <span style={{ color: C.textDim, fontSize: 12 }}>Não</span> : <button onClick={() => requestExpedir(o)}
                   style={{ padding: "5px 12px", borderRadius: 5, border: `1px solid ${C.green}55`, background: C.greenDim, color: C.green, cursor: "pointer", fontFamily: FH, fontSize: 11, fontWeight: 700 }}>
                   Expedido
-                </button>
-                <button onClick={() => openEditar(o)}
+                </button>}
+                {readOnly ? <span /> : <button onClick={() => openEditar(o)}
                   style={{ padding: "5px 10px", borderRadius: 5, border: `1px solid ${C.border}`, background: C.darkInput, color: C.textMuted, cursor: "pointer", fontFamily: FH, fontSize: 11, fontWeight: 700 }}>
                   ✎
-                </button>
+                </button>}
               </div>
             );
           })}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// PAGE: PLANEJAMENTO DE PRODUÇÃO (fila de pedidos sem itens + cancelados)
+// ============================================================
+function PlanningPage({ orders, currentUser, setEditingOrderId, setActivePage, reactivateOrder, deleteOrder, fetchEvents, eventsVersion, logistics, shift, isWorkDay }) {
+  const role = currentUser?.role;
+  const canPlan = role === "gestor" || role === "montador";
+  const isGestor = role === "gestor";
+  const today = getToday();
+  const [showCancelled, setShowCancelled] = useState(false);
+  const [historyFor, setHistoryFor] = useState(null);
+  const [reactivateFor, setReactivateFor] = useState(null);
+  const [confirm, setConfirm] = useState(null);
+
+  const queue = orders.filter(o => o.status === "planning").sort((a, b) => (a.deliveryDate || "").localeCompare(b.deliveryDate || ""));
+  const cancelled = orders.filter(o => o.status === "cancelled").sort((a, b) => String(b.cancelledAt || "").localeCompare(String(a.cancelledAt || "")));
+  const daysTo = ds => ds ? Math.round((new Date(ds + "T12:00:00") - new Date(today + "T12:00:00")) / 86400000) : null;
+  const open = id => { setEditingOrderId(id); setActivePage("demand"); };
+  const H = { padding: "8px 20px", borderBottom: `1px solid ${C.border}`, fontSize: 10, fontWeight: 700, color: C.textDim, fontFamily: FH, textTransform: "uppercase", letterSpacing: "0.06em", display: "grid", alignItems: "center", gap: 8 };
+  const R = { padding: "12px 20px", borderBottom: `1px solid ${C.border}`, fontSize: 13, color: C.text, fontFamily: F, display: "grid", alignItems: "center", gap: 8 };
+  const QCOLS = "90px 1.6fr 110px 120px 150px 1.4fr 110px";
+  const CCOLS = "90px 1.4fr 140px 2fr 190px";
+  const hOrder = historyFor ? orders.find(o => o.id === historyFor) : null;
+
+  return (
+    <div style={{ padding: 32, maxWidth: 1300, margin: "0 auto" }}>
+      <ConfirmDialog open={!!confirm} message={confirm?.message || ""} onYes={confirm?.onYes} onNo={confirm?.onNo} />
+      <ReasonModal open={!!reactivateFor} title="Reativar pedido" message={reactivateFor ? `#${reactivateFor.orderNumber} — ${reactivateFor.client}\nO pedido volta para a fila de Planejamento (sem dias de produção definidos).` : ""}
+        confirmLabel="Reativar" color={C.orange} onConfirm={r => { reactivateOrder(reactivateFor.id, r); setReactivateFor(null); }} onCancel={() => setReactivateFor(null)} />
+      <Modal open={!!hOrder} onClose={() => setHistoryFor(null)} title={hOrder ? `Histórico — #${hOrder.orderNumber} ${hOrder.client}` : ""} width={720}>
+        {hOrder && <OrderHistory order={hOrder} fetchEvents={fetchEvents} eventsVersion={eventsVersion} logistics={logistics} shift={shift} isWorkDay={isWorkDay} />}
+      </Modal>
+
+      <h1 style={{ margin: "0 0 6px", fontSize: 26, fontWeight: 800, color: C.text, fontFamily: FH, letterSpacing: "0.02em" }}>Planejamento de Produção</h1>
+      <div style={{ fontSize: 13, color: C.textMuted, fontFamily: F, marginBottom: 24 }}>Pedidos que entraram só com cliente, número e entrega. {canPlan ? "Clique em Planejar para definir itens, tempos e dias de produção." : "Aguardando o montador definir itens e dias."}</div>
+
+      <div style={{ background: C.darkCard, borderRadius: 10, border: `1px solid ${C.border}`, overflow: "hidden", marginBottom: 28 }}>
+        <div style={{ padding: "14px 20px", borderBottom: `1px solid ${C.border}`, display: "flex", alignItems: "center", gap: 10 }}>
+          <span style={{ fontSize: 14, fontWeight: 800, color: C.orange, fontFamily: FH, textTransform: "uppercase", letterSpacing: "0.06em" }}>🗂 Fila de Planejamento</span>
+          <span style={{ fontSize: 12, color: C.textMuted, fontFamily: F }}>({queue.length})</span>
+        </div>
+        <div style={{ ...H, gridTemplateColumns: QCOLS }}><span>Pedido</span><span>Cliente</span><span>Entrega</span><span>Prazo</span><span>Cadastrado</span><span>Observações</span><span /></div>
+        {queue.length === 0 && <div style={{ padding: 28, textAlign: "center", color: C.textDim, fontSize: 13, fontFamily: F }}>Nenhum pedido aguardando planejamento.</div>}
+        {queue.map(o => {
+          const d = daysTo(o.deliveryDate);
+          const dc = d === null ? C.textDim : d < 0 ? C.danger : d <= 3 ? C.orange : C.green;
+          return (
+            <div key={o.id} data-planning={o.id} style={{ ...R, gridTemplateColumns: QCOLS }}>
+              <span style={{ fontWeight: 800, color: C.red }}>#{o.orderNumber}</span>
+              <span style={{ fontWeight: 700 }}>{o.client}</span>
+              <span style={{ color: C.textMuted, fontSize: 12 }}>{fmtDateFull(o.deliveryDate)}</span>
+              <span style={{ fontSize: 12, fontWeight: 800, color: dc, fontFamily: FH }}>{d === null ? "—" : d < 0 ? `ATRASADO ${-d}d` : d === 0 ? "HOJE" : `${d} dia${d > 1 ? "s" : ""}`}</span>
+              <span style={{ color: C.textMuted, fontSize: 12 }}>{fmtDateTime(o.createdAt)}{o.createdBy ? <><br />{o.createdBy}</> : null}</span>
+              <span style={{ color: C.textMuted, fontSize: 12, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={o.observations}>{o.observations || "—"}</span>
+              <Btn variant={canPlan ? "custom" : "ghost"} onClick={() => open(o.id)} style={canPlan ? { padding: "7px 14px", fontSize: 12, background: C.orange, color: "#fff" } : { padding: "7px 14px", fontSize: 12 }}>{canPlan ? "Planejar" : "Ver"}</Btn>
+            </div>
+          );
+        })}
+      </div>
+
+      <div style={{ background: C.darkCard, borderRadius: 10, border: `1px solid ${C.border}`, overflow: "hidden" }}>
+        <button onClick={() => setShowCancelled(v => !v)} style={{ width: "100%", padding: "14px 20px", border: "none", background: "none", cursor: "pointer", display: "flex", alignItems: "center", gap: 10, borderBottom: showCancelled ? `1px solid ${C.border}` : "none" }}>
+          <span style={{ fontSize: 14, fontWeight: 800, color: C.textMuted, fontFamily: FH, textTransform: "uppercase", letterSpacing: "0.06em" }}>⛔ Pedidos Cancelados</span>
+          <span style={{ fontSize: 12, color: C.textMuted, fontFamily: F }}>({cancelled.length})</span>
+          <span style={{ marginLeft: "auto", color: C.textMuted }}>{showCancelled ? "▲" : "▼"}</span>
+        </button>
+        {showCancelled && (<>
+          <div style={{ ...H, gridTemplateColumns: CCOLS }}><span>Pedido</span><span>Cliente</span><span>Cancelado</span><span>Motivo</span><span /></div>
+          {cancelled.length === 0 && <div style={{ padding: 24, textAlign: "center", color: C.textDim, fontSize: 13, fontFamily: F }}>Nenhum pedido cancelado.</div>}
+          {cancelled.map(o => (
+            <div key={o.id} data-cancelled={o.id} style={{ ...R, gridTemplateColumns: CCOLS }}>
+              <span style={{ fontWeight: 800, color: C.textMuted }}>#{o.orderNumber}</span>
+              <span style={{ fontWeight: 700 }}>{o.client}</span>
+              <span style={{ color: C.textMuted, fontSize: 12 }}>{fmtDateTime(o.cancelledAt)}{o.cancelledBy ? <><br />{o.cancelledBy}</> : null}</span>
+              <span style={{ fontSize: 12 }}>{o.cancelReason || "—"}</span>
+              <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                <button onClick={() => setHistoryFor(o.id)} style={{ padding: "5px 10px", borderRadius: 5, border: `1px solid ${C.border}`, background: C.darkInput, color: C.textMuted, cursor: "pointer", fontFamily: FH, fontSize: 11, fontWeight: 700 }}>Histórico</button>
+                {isGestor && <button onClick={() => setReactivateFor(o)} style={{ padding: "5px 10px", borderRadius: 5, border: `1px solid ${C.orange}66`, background: C.orangeDim, color: C.orange, cursor: "pointer", fontFamily: FH, fontSize: 11, fontWeight: 700 }}>Reativar</button>}
+                {isGestor && <button onClick={() => setConfirm({ message: `Excluir definitivamente o pedido cancelado #${o.orderNumber} — ${o.client}?\n\nO registro no histórico de eventos é mantido.\nEsta ação não pode ser desfeita.`, onYes: () => { setConfirm(null); deleteOrder(o.id); }, onNo: () => setConfirm(null) })} style={{ padding: "5px 10px", borderRadius: 5, border: `1px solid ${C.danger}66`, background: C.dangerDim, color: C.danger, cursor: "pointer", fontFamily: FH, fontSize: 11, fontWeight: 700 }}>Excluir</button>}
+              </div>
+            </div>
+          ))}
+        </>)}
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// PAGE: CLIENTES (gestor) — cadastro, renomear, unificar duplicados
+// ============================================================
+function ClientsPage({ clientHistory, orders, addClient, renameClient, deleteClient }) {
+  const [search, setSearch] = useState("");
+  const [newName, setNewName] = useState("");
+  const [renameFor, setRenameFor] = useState(null);   // { from, to }
+  const [confirm, setConfirm] = useState(null);
+  const [distinct, setDistinct] = useState(() => LS.get("pcp_bvn_client_distinct", []));
+
+  const counts = {}; const lastDate = {};
+  orders.forEach(o => { counts[o.client] = (counts[o.client] || 0) + 1; if (!lastDate[o.client] || (o.deliveryDate || "") > lastDate[o.client]) lastDate[o.client] = o.deliveryDate; });
+  const unregistered = Object.keys(counts).filter(c => !clientHistory.includes(c)).sort();
+  const pairKey = (a, b) => [a, b].sort().join("||");
+  const pairs = [];
+  clientHistory.forEach(a => similarClients(a, clientHistory).forEach(b => { const k = pairKey(a, b); if (a < b && !distinct.includes(k)) pairs.push([a, b, k]); }));
+  const list = [...clientHistory].sort().filter(c => c.toLowerCase().includes(search.toLowerCase()));
+  const sim = newName ? similarClients(newName, clientHistory) : [];
+
+  function markDistinct(k) { const n = [...distinct, k]; setDistinct(n); LS.set("pcp_bvn_client_distinct", n); }
+  function askMerge(from, to) {
+    setConfirm({ message: `Unificar "${from}" em "${to}"?\n\n${counts[from] || 0} pedido(s) de "${from}" passarão a ser de "${to}", e "${from}" sai do cadastro.\nFica registrado no histórico de cada pedido.`, onYes: () => { setConfirm(null); renameClient(from, to); }, onNo: () => setConfirm(null) });
+  }
+  const small = (color) => ({ padding: "5px 10px", borderRadius: 5, border: `1px solid ${color}66`, background: `${color}1f`, color, cursor: "pointer", fontFamily: FH, fontSize: 11, fontWeight: 700 });
+
+  return (
+    <div style={{ padding: 32, maxWidth: 1100, margin: "0 auto" }}>
+      <ConfirmDialog open={!!confirm} message={confirm?.message || ""} onYes={confirm?.onYes} onNo={confirm?.onNo} />
+      <Modal open={!!renameFor} onClose={() => setRenameFor(null)} title={`Renomear / unificar "${renameFor?.from || ""}"`} width={480}>
+        {renameFor && (() => {
+          const target = normName(renameFor.to); const exists = clientHistory.includes(target) && target !== renameFor.from;
+          return (
+            <div>
+              <Field label="Novo nome (ou nome de um cliente existente para unificar)">
+                <input value={renameFor.to} onChange={e => setRenameFor({ ...renameFor, to: e.target.value.toUpperCase() })} list="clients-dl" style={inputStyle} autoFocus />
+                <datalist id="clients-dl">{clientHistory.filter(c => c !== renameFor.from).map(c => <option key={c} value={c} />)}</datalist>
+              </Field>
+              <div style={{ fontSize: 12, color: exists ? C.yellow : C.textMuted, fontFamily: F, marginBottom: 16 }}>
+                {exists ? `"${target}" já existe — os ${counts[renameFor.from] || 0} pedido(s) serão UNIFICADOS nele.` : `${counts[renameFor.from] || 0} pedido(s) serão renomeados para "${target}".`}
+              </div>
+              <div style={{ display: "flex", gap: 12, justifyContent: "flex-end" }}>
+                <Btn variant="ghost" onClick={() => setRenameFor(null)}>Voltar</Btn>
+                <Btn onClick={() => { if (target && target !== renameFor.from) { renameClient(renameFor.from, target); setRenameFor(null); } }} disabled={!target || target === renameFor.from}>{exists ? "Unificar" : "Renomear"}</Btn>
+              </div>
+            </div>
+          );
+        })()}
+      </Modal>
+
+      <h1 style={{ margin: "0 0 24px", fontSize: 26, fontWeight: 800, color: C.text, fontFamily: FH, letterSpacing: "0.02em" }}>Clientes</h1>
+
+      {pairs.length > 0 && (
+        <div style={{ background: C.darkCard, borderRadius: 10, border: `1px solid ${C.yellow}40`, overflow: "hidden", marginBottom: 24 }}>
+          <div style={{ padding: "14px 20px", borderBottom: `1px solid ${C.border}`, background: C.yellowDim }}>
+            <span style={{ fontSize: 14, fontWeight: 800, color: C.yellow, fontFamily: FH, textTransform: "uppercase", letterSpacing: "0.06em" }}>⚠ Possíveis duplicados ({pairs.length})</span>
+            <div style={{ fontSize: 12, color: C.textMuted, fontFamily: F, marginTop: 2 }}>Nomes parecidos. Se forem a mesma empresa, unifique; se não, marque "São diferentes" para não aparecer mais.</div>
+          </div>
+          {pairs.map(([a, b, k]) => (
+            <div key={k} style={{ display: "grid", gridTemplateColumns: "1fr 1fr auto", gap: 10, padding: "10px 20px", borderBottom: `1px solid ${C.border}`, alignItems: "center", fontFamily: F, fontSize: 13 }}>
+              <span><strong style={{ color: C.text }}>{a}</strong> <span style={{ color: C.textDim }}>({counts[a] || 0})</span></span>
+              <span><strong style={{ color: C.text }}>{b}</strong> <span style={{ color: C.textDim }}>({counts[b] || 0})</span></span>
+              <div style={{ display: "flex", gap: 6 }}>
+                <button onClick={() => askMerge(b, a)} style={small(C.green)}>Manter {a.length > 14 ? a.slice(0, 14) + "…" : a}</button>
+                <button onClick={() => askMerge(a, b)} style={small(C.green)}>Manter {b.length > 14 ? b.slice(0, 14) + "…" : b}</button>
+                <button onClick={() => markDistinct(k)} style={small(C.steel)}>São diferentes</button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {unregistered.length > 0 && (
+        <div style={{ background: C.darkCard, borderRadius: 10, border: `1px solid ${C.orange}40`, padding: "14px 20px", marginBottom: 24 }}>
+          <div style={{ fontSize: 13, fontWeight: 800, color: C.orange, fontFamily: FH, textTransform: "uppercase", marginBottom: 8 }}>Nomes usados em pedidos mas fora do cadastro</div>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+            {unregistered.map(c => (
+              <span key={c} style={{ display: "inline-flex", gap: 6, alignItems: "center", padding: "4px 8px", borderRadius: 6, background: C.dark, border: `1px solid ${C.border}`, fontSize: 12, color: C.text, fontFamily: F }}>
+                "{c}" ({counts[c]})
+                <button onClick={() => normName(c) === c ? addClient(c) : renameClient(c, c)} style={small(C.orange)}>{normName(c) === c ? "Cadastrar" : "Corrigir"}</button>
+                <button onClick={() => setRenameFor({ from: c, to: normName(c) })} style={small(C.steel)}>Unificar…</button>
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
+
+      <div style={{ background: C.darkCard, borderRadius: 10, border: `1px solid ${C.border}`, padding: 20, marginBottom: 24 }}>
+        <div style={{ display: "flex", gap: 12, alignItems: "flex-end" }}>
+          <div style={{ flex: 1 }}>
+            <label style={labelStyle}>Novo cliente</label>
+            <input value={newName} onChange={e => setNewName(e.target.value.toUpperCase())} placeholder="Nome do cliente" style={inputStyle} />
+          </div>
+          <Btn onClick={() => { if (normName(newName) && !clientHistory.includes(normName(newName))) { addClient(newName); setNewName(""); } }} disabled={!normName(newName) || clientHistory.includes(normName(newName))} style={{ height: 42 }}>{sim.length ? "Cadastrar mesmo assim" : "Cadastrar"}</Btn>
+        </div>
+        {clientHistory.includes(normName(newName)) && <div style={{ marginTop: 8, fontSize: 12, color: C.danger, fontFamily: F }}>Já cadastrado.</div>}
+        {sim.length > 0 && <div style={{ marginTop: 8, fontSize: 12, color: C.yellow, fontFamily: F }}>⚠ Parecido com: {sim.join(", ")}</div>}
+      </div>
+
+      <div style={{ background: C.darkCard, borderRadius: 10, border: `1px solid ${C.border}` }}>
+        <div style={{ padding: "14px 20px", borderBottom: `1px solid ${C.border}`, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <span style={{ fontSize: 13, fontWeight: 700, color: C.text, fontFamily: FH, textTransform: "uppercase", letterSpacing: "0.04em" }}>Clientes Cadastrados ({clientHistory.length})</span>
+          <input value={search} onChange={e => setSearch(e.target.value)} placeholder="Pesquisar..." style={{ ...inputStyle, width: 220 }} />
+        </div>
+        <div style={{ display: "grid", gridTemplateColumns: "2fr 90px 130px 200px", padding: "8px 20px", borderBottom: `1px solid ${C.border}`, fontSize: 10, fontWeight: 700, color: C.textDim, fontFamily: FH, textTransform: "uppercase", letterSpacing: "0.08em" }}>
+          <span>Nome</span><span>Pedidos</span><span>Última entrega</span><span></span>
+        </div>
+        <div style={{ maxHeight: 480, overflow: "auto" }}>
+          {list.map(c => (
+            <div key={c} data-client={c} style={{ display: "grid", gridTemplateColumns: "2fr 90px 130px 200px", padding: "10px 20px", borderBottom: `1px solid ${C.border}`, fontSize: 13, color: C.text, fontFamily: F, alignItems: "center" }}>
+              <span style={{ fontWeight: 700 }}>{c}</span>
+              <span>{counts[c] || 0}</span>
+              <span style={{ color: C.textMuted, fontSize: 12 }}>{lastDate[c] ? fmtDateFull(lastDate[c]) : "—"}</span>
+              <div style={{ display: "flex", gap: 6 }}>
+                <button onClick={() => setRenameFor({ from: c, to: c })} style={small(C.steel)}>Renomear / Unificar</button>
+                {!counts[c] && <button onClick={() => setConfirm({ message: `Excluir o cliente "${c}" do cadastro?`, onYes: () => { setConfirm(null); deleteClient(c); }, onNo: () => setConfirm(null) })} style={small(C.danger)}>Excluir</button>}
+              </div>
+            </div>
+          ))}
         </div>
       </div>
     </div>
@@ -1691,7 +2594,7 @@ function LogisticsPage({ orders, logistics, saveLogistics, updateOrder }) {
 // ============================================================
 function MissingItemsPage({ orders, updateOrder, setEditingOrderId, setActivePage }) {
   const rows = [];
-  orders.forEach(o => {
+  orders.filter(isActiveOrder).forEach(o => {
     (o.missingItems || []).forEach(m => {
       if (!m.delivered) rows.push({ orderId: o.id, orderNumber: o.orderNumber, client: o.client, status: o.status, deliveryDate: o.deliveryDate, code: m.code, qty: m.qty });
     });
@@ -1713,11 +2616,10 @@ function MissingItemsPage({ orders, updateOrder, setEditingOrderId, setActivePag
   function markDelivered(orderId, code) {
     const order = orders.find(o => o.id === orderId);
     if (!order) return;
-    updateOrder(orderId, { missingItems: (order.missingItems || []).map(m => m.code === code ? { ...m, delivered: true } : m) });
+    const m = (order.missingItems || []).find(x => x.code === code);
+    updateOrder(orderId, { missingItems: (order.missingItems || []).map(m => m.code === code ? { ...m, delivered: true } : m) }, { type: "faltante_entregue", details: { code, qty: m?.qty } });
   }
 
-  const STATUS_LABEL = { scheduled: "Programado", executing: "Em Execução", completed: "Concluído" };
-  const STATUS_COLOR = { scheduled: C.red, executing: C.yellow, completed: C.blue };
 
   const editOrder = (id) => { setEditingOrderId(id); setActivePage("demand"); };
 
@@ -1939,6 +2841,7 @@ const LSK = {
   logistics:'pcp_bvn_logistics',
   users:    'pcp_bvn_users',
   sync:     'pcp_bvn_lastsync',
+  events:   'pcp_bvn_pending_events', // eventos de histórico ainda não enviados (offline/tabela ausente)
 };
 
 // ============================================================
@@ -1960,6 +2863,13 @@ export default function App() {
   const [toasts, setToasts] = useState([]);
   const [offlineMode, setOfflineMode] = useState(false);
   const [syncing, setSyncing] = useState(false);
+  const [eventsVersion, setEventsVersion] = useState(0);
+  const [eventsTableMissing, setEventsTableMissing] = useState(false);
+  const currentUserRef = useRef(null);
+  useEffect(() => { currentUserRef.current = currentUser; }, [currentUser]);
+
+  const shift = useMemo(() => ({ ...defaultShift, ...(calendarSettings.shift || {}) }), [calendarSettings]);
+  const isWorkDay = useCallback(ds => hoursForDay(ds, calendarSettings, dayOverrides) > 0, [calendarSettings, dayOverrides]);
 
   const calendarSettingsRef = useRef(calendarSettings);
   const dayOverridesRef = useRef(dayOverrides);
@@ -2036,7 +2946,75 @@ export default function App() {
 
   function mapOrder(o) {
     const status = o.status === 'delivered' ? 'completed' : o.status;
-    return { id: o.id, client: o.client, orderNumber: o.order_number, deliveryDate: o.delivery_date, productionStart: o.production_start, productionEnd: o.production_end, status, observations: o.observations || '', items: o.items || [], itemsCompleted: o.items_completed || {}, productionDays: o.production_days || [], missingItems: o.missing_items || [] };
+    return {
+      id: o.id, client: o.client, orderNumber: o.order_number, deliveryDate: o.delivery_date, productionStart: o.production_start, productionEnd: o.production_end, status, observations: o.observations || '', items: o.items || [], itemsCompleted: o.items_completed || {}, productionDays: o.production_days || [], missingItems: o.missing_items || [],
+      // rastreio (colunas created_by/executed_at/completed_at já existiam de versão antiga — reaproveitadas)
+      createdAt: o.created_at || null, createdAtTs: o.created_at_ts || null, createdBy: o.created_by || '',
+      plannedAt: o.planned_at || null, plannedBy: o.planned_by || '',
+      executedAt: o.executed_at || null, executedBy: o.executed_by || '',
+      completedAt: o.completed_at || null, completedBy: o.completed_by || '',
+      execSessions: o.exec_sessions || [], execSeconds: o.exec_seconds ?? null, execWallSeconds: o.exec_wall_seconds ?? null,
+      cancelReason: o.cancel_reason || '', cancelledAt: o.cancelled_at || null, cancelledBy: o.cancelled_by || '',
+      originalDeliveryDate: o.original_delivery_date || null,
+    };
+  }
+  // Campos JS → colunas do Supabase
+  const ORDER_DB_FIELDS = {
+    client: 'client', orderNumber: 'order_number', deliveryDate: 'delivery_date', productionStart: 'production_start', productionEnd: 'production_end',
+    productionDays: 'production_days', status: 'status', observations: 'observations', items: 'items', itemsCompleted: 'items_completed',
+    createdBy: 'created_by', plannedAt: 'planned_at', plannedBy: 'planned_by', executedAt: 'executed_at', executedBy: 'executed_by',
+    completedAt: 'completed_at', completedBy: 'completed_by', execSessions: 'exec_sessions', execSeconds: 'exec_seconds', execWallSeconds: 'exec_wall_seconds',
+    cancelReason: 'cancel_reason', cancelledAt: 'cancelled_at', cancelledBy: 'cancelled_by', originalDeliveryDate: 'original_delivery_date',
+  };
+  // Colunas criadas pelo script SQL da v1.5.0 — se ainda não existirem, o app grava sem elas em vez de falhar
+  const NEW_COLS = ['planned_at', 'planned_by', 'exec_sessions', 'exec_seconds', 'exec_wall_seconds', 'cancel_reason', 'cancelled_at', 'cancelled_by', 'original_delivery_date'];
+  const missingColsRef = useRef(false);
+  function toDb(changes) {
+    const db = {};
+    Object.entries(ORDER_DB_FIELDS).forEach(([k, col]) => { if (changes[k] !== undefined) db[col] = changes[k]; });
+    if (changes.missingItems !== undefined) {
+      db.missing_items = changes.missingItems;
+      db.has_complementary = changes.missingItems.length > 0;
+      db.complementary_complete = changes.missingItems.length === 0 || changes.missingItems.every(i => i.delivered);
+    }
+    if (missingColsRef.current) NEW_COLS.forEach(c => delete db[c]);
+    return db;
+  }
+  const isMissingColErr = e => e && (e.code === 'PGRST204' || /column .* does not exist|Could not find the .* column/i.test(e.message || ''));
+
+  // ── Histórico: grava evento (servidor carimba data/hora); offline → fila local ──
+  function logEvent(orderLike, type, details = {}) {
+    const u = currentUserRef.current;
+    const ev = { order_id: String(orderLike.id), order_number: orderLike.orderNumber || '', client: orderLike.client || '', type, details, username: u?.username || '', user_name: u?.name || u?.username || '', client_ts: new Date().toISOString() };
+    supabase.from('order_events').insert(ev).then(({ error }) => {
+      if (error) {
+        if (error.code === '42P01' || error.code === 'PGRST205' || /order_events/.test(error.message || '')) setEventsTableMissing(true);
+        LS.set(LSK.events, [...LS.get(LSK.events, []), ev]);
+      }
+      setEventsVersion(v => v + 1);
+    });
+  }
+  async function flushPendingEvents() {
+    const pending = LS.get(LSK.events, []);
+    if (!pending.length) return;
+    const { error } = await supabase.from('order_events').insert(pending);
+    if (!error) { LS.set(LSK.events, []); setEventsTableMissing(false); setEventsVersion(v => v + 1); }
+    else if (error.code === '42P01' || error.code === 'PGRST205') setEventsTableMissing(true);
+  }
+  async function fetchEvents(orderId) {
+    const pending = LS.get(LSK.events, []).filter(e => e.order_id === String(orderId)).map(e => ({ ...e, ts: e.client_ts, pending: true }));
+    const { data, error } = await supabase.from('order_events').select('*').eq('order_id', String(orderId)).order('ts', { ascending: true });
+    if (error) return { events: pending, error: (error.code === '42P01' || error.code === 'PGRST205') ? "A tabela de histórico ainda não foi criada no Supabase — os eventos estão guardados neste computador e serão enviados depois." : "Não foi possível carregar o histórico do servidor (modo offline)." };
+    return { events: [...(data || []), ...pending], error: null };
+  }
+  async function fetchAllEvents() {
+    const all = []; const size = 1000;
+    for (let from = 0; from < 200000; from += size) {
+      const { data, error } = await supabase.from('order_events').select('*').order('ts', { ascending: true }).range(from, from + size - 1);
+      if (error) return { events: all, error };
+      all.push(...data); if (data.length < size) break;
+    }
+    return { events: all, error: null };
   }
   function mapUser(u) {
     return { username: u.username, password: u.password, name: u.name || u.username, role: u.role };
@@ -2115,6 +3093,14 @@ export default function App() {
       setOfflineMode(false);
       setLoading(false);
       LS.set(LSK.sync, new Date().toISOString());
+      // Confere se o script SQL da v1.5.0 já foi aplicado (tabela de histórico + colunas novas)
+      const [evProbe, colProbe] = await Promise.all([
+        supabase.from('order_events').select('id').limit(1),
+        supabase.from('orders').select('exec_sessions,cancel_reason').limit(1),
+      ]);
+      missingColsRef.current = !!colProbe.error;
+      setEventsTableMissing(!!evProbe.error || !!colProbe.error);
+      if (!evProbe.error) flushPendingEvents();
     } catch (e) {
       console.error("Supabase indisponível:", e);
       if (hasCache) {
@@ -2187,46 +3173,92 @@ export default function App() {
       return;
     }
     
-    setOrders(prev => [...prev, order]);
-    const { error } = await supabase.from('orders').insert({
-      id: String(order.id),
-      client: order.client,
-      order_number: order.orderNumber,
-      delivery_date: order.deliveryDate,
-      production_start: order.productionStart,
-      production_end: order.productionEnd,
-      production_days: order.productionDays || [],
-      status: order.status,
-      observations: order.observations,
-      items: order.items,
-      items_completed: order.itemsCompleted,
-      missing_items: order.missingItems || [],
-      has_complementary: (order.missingItems || []).length > 0,
-      complementary_complete: (order.missingItems || []).length === 0,
-    });
-    if (error) handleSaveError(error, () => setOrders(prev => prev.filter(o => o.id !== order.id)), "Erro ao salvar pedido. Tente novamente.");
+    const u = currentUserRef.current;
+    const full = { execSessions: [], ...order, createdBy: u?.username || '', createdAt: new Date().toISOString() };
+    setOrders(prev => [...prev, full]);
+    const row = { id: String(order.id), ...toDb({ ...full, createdAt: undefined }), missing_items: order.missingItems || [], has_complementary: (order.missingItems || []).length > 0, complementary_complete: (order.missingItems || []).length === 0 };
+    let { error } = await supabase.from('orders').insert(row);
+    if (error && isMissingColErr(error)) { missingColsRef.current = true; setEventsTableMissing(true); NEW_COLS.forEach(c => delete row[c]); ({ error } = await supabase.from('orders').insert(row)); }
+    if (error) { handleSaveError(error, () => setOrders(prev => prev.filter(o => o.id !== order.id)), "Erro ao salvar pedido. Tente novamente."); return; }
+    logEvent(full, 'criado', { status: full.status, items: (full.items || []).length, totalTime: orderTotalTime(full), days: full.productionDays || [], deliveryDate: full.deliveryDate });
+    if (full.status === 'scheduled') logEvent(full, 'planejado', { items: full.items.length, totalTime: orderTotalTime(full), days: full.productionDays, note: 'Cadastrado já com itens e dias' });
   }
-  async function updateOrder(id, changes) {
+  // events: evento (ou lista) { type, details } gravado no histórico se o update funcionar
+  async function updateOrder(id, changes, events) {
     const prev = orders.find(o => o.id === id);
     setOrders(p => p.map(o => o.id === id ? { ...o, ...changes } : o));
-    const db = {};
-    if (changes.client !== undefined) db.client = changes.client;
-    if (changes.orderNumber !== undefined) db.order_number = changes.orderNumber;
-    if (changes.deliveryDate !== undefined) db.delivery_date = changes.deliveryDate;
-    if (changes.productionStart !== undefined) db.production_start = changes.productionStart;
-    if (changes.productionEnd !== undefined) db.production_end = changes.productionEnd;
-    if (changes.productionDays !== undefined) db.production_days = changes.productionDays;
-    if (changes.status !== undefined) db.status = changes.status;
-    if (changes.observations !== undefined) db.observations = changes.observations;
-    if (changes.items !== undefined) db.items = changes.items;
-    if (changes.itemsCompleted !== undefined) db.items_completed = changes.itemsCompleted;
-    if (changes.missingItems !== undefined) {
-      db.missing_items = changes.missingItems;
-      db.has_complementary = changes.missingItems.length > 0;
-      db.complementary_complete = changes.missingItems.length === 0 || changes.missingItems.every(i => i.delivered);
+    const db = toDb(changes);
+    let { error } = Object.keys(db).length ? await supabase.from('orders').update(db).eq('id', String(id)) : { error: null };
+    if (error && isMissingColErr(error)) { missingColsRef.current = true; setEventsTableMissing(true); const db2 = toDb(changes); ({ error } = Object.keys(db2).length ? await supabase.from('orders').update(db2).eq('id', String(id)) : { error: null }); }
+    if (error) { handleSaveError(error, () => { if (prev) setOrders(p => p.map(o => o.id === id ? prev : o)); }, "Erro ao atualizar pedido. Alteração desfeita."); if (!(offlineModeRef.current || error?.status === 0)) return; }
+    const ref = { ...(prev || { id }), ...changes };
+    [].concat(events || []).forEach(ev => ev && logEvent(ref, ev.type, ev.details || {}));
+  }
+
+  // ── Execução: cronômetro por sessões ─────────────────────────
+  function startExecution(id) {
+    const o = orders.find(x => x.id === id); if (!o || o.status === 'executing') return;
+    const u = currentUserRef.current; const now = new Date().toISOString();
+    const sessions = [...(o.execSessions || []), { start: now, by: u?.username || '' }];
+    const parallel = orders.filter(x => x.status === 'executing' && x.id !== id).map(x => `#${x.orderNumber}`);
+    const first = !(o.execSessions || []).length && !o.executedAt;
+    updateOrder(id, { status: 'executing', execSessions: sessions, ...(first ? { executedAt: now, executedBy: u?.username || '' } : {}) },
+      { type: first ? 'execucao_iniciada' : 'execucao_retomada', details: { parallel } });
+  }
+  function closeSession(o, endType, reason) {
+    const now = new Date().toISOString(); const u = currentUserRef.current;
+    const sessions = [...(o.execSessions || [])];
+    if (sessions.length && !sessions[sessions.length - 1].end) sessions[sessions.length - 1] = { ...sessions[sessions.length - 1], end: now, endBy: u?.username || '', endType, ...(reason ? { reason } : {}) };
+    return { sessions, now };
+  }
+  function pauseExecution(id, reason, scheduleChanges = {}) {
+    const o = orders.find(x => x.id === id); if (!o) return;
+    const { sessions } = closeSession(o, 'pause', reason);
+    const t = execTotals({ ...o, execSessions: sessions }, shift, isWorkDay);
+    updateOrder(id, { status: 'scheduled', execSessions: sessions, ...scheduleChanges },
+      { type: 'execucao_pausada', details: { reason, execBusiness: t.business, execWall: t.wall, estimated: orderTotalTime(o), ...(scheduleChanges.productionDays ? { daysBefore: effectiveDays(o), daysAfter: scheduleChanges.productionDays } : {}) } });
+  }
+  function completeOrder(id, location) {
+    const o = orders.find(x => x.id === id); if (!o) return;
+    const u = currentUserRef.current;
+    const { sessions, now } = closeSession(o, 'complete');
+    const t = execTotals({ ...o, execSessions: sessions }, shift, isWorkDay);
+    const pendingItems = o.items.filter(i => !o.itemsCompleted[i.code]).map(i => i.code);
+    updateOrder(id, { status: 'completed', execSessions: sessions, completedAt: now, completedBy: u?.username || '', execSeconds: t.business, execWallSeconds: t.wall },
+      { type: 'concluido', details: { location, execBusiness: t.business, execWall: t.wall, estimated: orderTotalTime(o), pauses: t.pauses, pendingItems, missing: (o.missingItems || []).filter(m => !m.delivered).map(m => `${m.code}×${m.qty}`) } });
+  }
+  function cancelOrder(id, reason) {
+    const o = orders.find(x => x.id === id); if (!o) return;
+    const u = currentUserRef.current;
+    const extra = o.status === 'executing' ? { execSessions: closeSession(o, 'cancel', reason).sessions } : {};
+    updateOrder(id, { status: 'cancelled', cancelReason: reason, cancelledAt: new Date().toISOString(), cancelledBy: u?.username || '', ...extra },
+      { type: 'cancelado', details: { reason, status: o.status } });
+    showToast(`Pedido #${o.orderNumber} cancelado.`, "success");
+  }
+  function reactivateOrder(id, reason) {
+    const o = orders.find(x => x.id === id); if (!o) return;
+    // Volta para o Planejamento: os dias antigos provavelmente já passaram
+    updateOrder(id, { status: 'planning', productionDays: [], productionStart: '', productionEnd: '', cancelReason: '', cancelledAt: null, cancelledBy: '' },
+      { type: 'reativado', details: { reason, daysBefore: effectiveDays(o), daysAfter: [] } });
+    showToast(`Pedido #${o.orderNumber} reativado — voltou para o Planejamento.`, "success");
+  }
+
+  async function deleteOrder(id) {
+    const prev = orders.find(o => o.id === id);
+    if (!prev) return;
+    logEvent(prev, 'excluido', { status: prev.status, items: prev.items.length, totalTime: orderTotalTime(prev), note: prev.cancelReason ? `Estava cancelado: ${prev.cancelReason}` : undefined });
+    setOrders(p => p.filter(o => o.id !== id));
+    const { error } = await supabase.from('orders').delete().eq('id', String(id));
+    if (error) {
+      handleSaveError(error, () => setOrders(p => p.some(o => o.id === id) ? p : [...p, prev]), "Erro ao excluir pedido. Exclusão desfeita.");
+      return;
     }
-    const { error } = await supabase.from('orders').update(db).eq('id', String(id));
-    if (error) handleSaveError(error, () => { if (prev) setOrders(p => p.map(o => o.id === id ? prev : o)); }, "Erro ao atualizar pedido. Alteração desfeita.");
+    // Remove também o registro de logística órfão
+    if (logistics[String(id)]) {
+      const { [String(id)]: _removed, ...rest } = logistics;
+      saveLogistics(rest);
+    }
+    showToast(`Pedido #${prev.orderNumber} excluído.`, "success");
   }
   async function addItem(item) {
     setRegisteredItems(prev => [...prev, item]);
@@ -2258,11 +3290,34 @@ export default function App() {
     const { error } = await supabase.from('items').delete().eq('code', code);
     if (error) handleSaveError(error, () => { if (prev) setRegisteredItems(p => [...p, prev]); }, "Erro ao excluir item. Tente novamente.");
   }
-  async function addClient(name) {
-    if (clientHistory.includes(name)) return;
+  // client_history passa a ser o CADASTRO de clientes (nome normalizado: maiúsculo, sem espaços sobrando)
+  async function addClient(rawName) {
+    const name = normName(rawName);
+    if (!name || clientHistory.includes(name)) return name;
     setClientHistory(prev => [...prev, name]);
     const { error } = await supabase.from('client_history').insert({ name });
-    if (error && error.code !== '23505') console.error(error);
+    if (error && error.code !== '23505') handleSaveError(error, () => setClientHistory(prev => prev.filter(c => c !== name)), "Erro ao cadastrar cliente.");
+    return name;
+  }
+  // Renomeia ou unifica: todos os pedidos de "from" passam para "to"; "from" sai do cadastro
+  async function renameClient(from, rawTo) {
+    const to = normName(rawTo);
+    if (!to || from === to) return;
+    const affected = orders.filter(o => o.client === from);
+    setOrders(p => p.map(o => o.client === from ? { ...o, client: to } : o));
+    setClientHistory(p => { const s = p.filter(c => c !== from); return s.includes(to) ? s : [...s, to]; });
+    const r1 = await supabase.from('orders').update({ client: to }).eq('client', from);
+    if (r1.error) { handleSaveError(r1.error, () => loadData(), "Erro ao renomear cliente nos pedidos."); return; }
+    await supabase.from('client_history').insert({ name: to }).then(() => {});
+    await supabase.from('client_history').delete().eq('name', from);
+    affected.forEach(o => logEvent({ ...o, client: to }, 'cliente_unificado', { fromClient: from, toClient: to }));
+    showToast(`"${from}" → "${to}" (${affected.length} pedido${affected.length === 1 ? "" : "s"}).`, "success");
+  }
+  async function deleteClient(name) {
+    if (orders.some(o => o.client === name)) { showToast("Cliente tem pedidos — use Unificar em vez de excluir."); return; }
+    setClientHistory(p => p.filter(c => c !== name));
+    const { error } = await supabase.from('client_history').delete().eq('name', name);
+    if (error) handleSaveError(error, () => setClientHistory(p => [...p, name]), "Erro ao excluir cliente.");
   }
   async function saveCalendarSettings(newSettings) {
     const prev = calendarSettings;
@@ -2375,17 +3430,24 @@ export default function App() {
           <button onClick={loadData} style={{ padding: "4px 14px", borderRadius: 4, border: "none", background: C.dark, color: C.yellow, cursor: "pointer", fontFamily: FH, fontSize: 12, fontWeight: 700, letterSpacing: "0.04em" }}>↺ Reconectar</button>
         </div>
       )}
+      {eventsTableMissing && !offlineMode && currentUser.role === "gestor" && (
+        <div style={{ position: "fixed", bottom: 0, left: 0, right: 0, zIndex: 1900, background: C.orange, color: "#fff", padding: "7px 20px", fontSize: 12, fontWeight: 700, fontFamily: FH, letterSpacing: "0.03em" }}>
+          ⚠ Banco ainda sem as tabelas/colunas da v1.5.0 (histórico, cancelamento, cronômetro). Rode o script supabase_v1.5.0.sql no SQL Editor do Supabase. Até lá, o histórico fica guardado neste computador.
+        </div>
+      )}
       <div style={{ display: "flex", height: "100vh", background: C.dark, fontFamily: F, overflow: "hidden", paddingTop: offlineMode ? 34 : syncing ? 26 : 0 }}>
-        <Sidebar activePage={activePage} setActivePage={setActivePage} currentUser={currentUser} onLogout={handleLogout} />
+        <Sidebar activePage={activePage} setActivePage={p => { if (p !== "demand") setEditingOrderId(null); setActivePage(p); }} currentUser={currentUser} onLogout={handleLogout} badges={{ planning: orders.filter(o => o.status === "planning").length }} />
         <div style={{ flex: 1, overflow: "auto" }}>
-          {activePage === "demand" && <DemandPage orders={orders} addOrder={addOrder} updateOrder={updateOrder} registeredItems={registeredItems} clientHistory={clientHistory} addClient={addClient} editingOrderId={editingOrderId} setEditingOrderId={setEditingOrderId} setActivePage={setActivePage} calendarSettings={calendarSettings} dayOverrides={dayOverrides} />}
+          {activePage === "demand" && <DemandPage orders={orders} addOrder={addOrder} updateOrder={updateOrder} deleteOrder={currentUser.role === "gestor" ? deleteOrder : null} cancelOrder={cancelOrder} currentUser={currentUser} addItem={addItem} fetchEvents={fetchEvents} eventsVersion={eventsVersion} logistics={logistics} shift={shift} isWorkDay={isWorkDay} registeredItems={registeredItems} clientHistory={clientHistory} addClient={addClient} editingOrderId={editingOrderId} setEditingOrderId={setEditingOrderId} setActivePage={setActivePage} calendarSettings={calendarSettings} dayOverrides={dayOverrides} />}
           {activePage === "calendar" && <CalendarPage orders={orders} updateOrder={updateOrder} calendarSettings={calendarSettings} saveCalendarSettings={saveCalendarSettings} dayOverrides={dayOverrides} saveDayOverrides={saveDayOverrides} setEditingOrderId={setEditingOrderId} setActivePage={setActivePage} logistics={logistics} />}
-          {activePage === "open" && <OpenDemandsPage orders={orders} updateOrder={updateOrder} setEditingOrderId={setEditingOrderId} setActivePage={setActivePage} logistics={logistics} saveLogistics={saveLogistics} />}
-          {activePage === "logistics" && <LogisticsPage orders={orders} logistics={logistics} saveLogistics={saveLogistics} updateOrder={updateOrder} />}
+          {activePage === "planning" && <PlanningPage orders={orders} currentUser={currentUser} setEditingOrderId={setEditingOrderId} setActivePage={setActivePage} reactivateOrder={reactivateOrder} deleteOrder={deleteOrder} fetchEvents={fetchEvents} eventsVersion={eventsVersion} logistics={logistics} shift={shift} isWorkDay={isWorkDay} />}
+          {activePage === "open" && <OpenDemandsPage orders={orders} updateOrder={updateOrder} setEditingOrderId={setEditingOrderId} setActivePage={setActivePage} logistics={logistics} saveLogistics={saveLogistics} currentUser={currentUser} startExecution={startExecution} pauseExecution={pauseExecution} completeOrder={completeOrder} shift={shift} isWorkDay={isWorkDay} />}
+          {activePage === "logistics" && <LogisticsPage orders={orders} logistics={logistics} saveLogistics={saveLogistics} updateOrder={updateOrder} logEvent={logEvent} readOnly={currentUser.role === "vendedor"} />}
           {activePage === "missing" && (currentUser.role === "gestor" || currentUser.role === "montador") && <MissingItemsPage orders={orders} updateOrder={updateOrder} setEditingOrderId={setEditingOrderId} setActivePage={setActivePage} />}
           {activePage === "items" && (currentUser.role === "gestor" || currentUser.role === "montador") && <ItemsPage registeredItems={registeredItems} addItem={addItem} updateItem={updateItem} deleteItem={deleteItem} />}
           {activePage === "reports" && currentUser.role === "gestor" && <ReportsPage orders={orders} registeredItems={registeredItems} calendarSettings={calendarSettings} dayOverrides={dayOverrides} />}
-          {activePage === "export" && currentUser.role === "gestor" && <ExportPage orders={orders} registeredItems={registeredItems} />}
+          {activePage === "export" && currentUser.role === "gestor" && <ExportPage orders={orders} registeredItems={registeredItems} fetchAllEvents={fetchAllEvents} logistics={logistics} />}
+          {activePage === "clients" && currentUser.role === "gestor" && <ClientsPage clientHistory={clientHistory} orders={orders} addClient={addClient} renameClient={renameClient} deleteClient={deleteClient} />}
           {activePage === "users" && currentUser.role === "gestor" && <UsersPage users={users} addUser={addUser} updateUser={updateUser} deleteUser={deleteUser} currentUser={currentUser} />}
         </div>
       </div>

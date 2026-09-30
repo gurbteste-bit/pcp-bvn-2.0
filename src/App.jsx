@@ -246,6 +246,83 @@ function Btn({ children, onClick, variant = "primary", disabled, style: s }) {
 }
 
 // ============================================================
+// CONSULTA DE PEDIDO — janela somente leitura (vendedor não edita pedido já cadastrado)
+// ============================================================
+function OrderViewModal({ order, logistics, onClose }) {
+  if (!order) return null;
+  const o = order;
+  const logi = (logistics || {})[String(o.id)] || {};
+  const sc = STATUS_COLOR[o.status] || C.textMuted;
+  const days = normalizeDays(effectiveDays(o));
+  const items = o.items || [];
+  const missing = o.missingItems || [];
+  const late = o.deliveryDate && o.deliveryDate < getToday() && !["completed", "cancelled"].includes(o.status);
+  const lbl = { fontSize: 10, fontWeight: 700, color: C.textDim, fontFamily: FH, textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 3 };
+  const val = { fontSize: 14, color: C.text, fontFamily: F, fontWeight: 600 };
+  const sec = { fontSize: 12, fontWeight: 800, color: C.textDim, fontFamily: FH, textTransform: "uppercase", letterSpacing: "0.08em", margin: "20px 0 8px" };
+  const row = { display: "grid", gap: 8, alignItems: "center", padding: "8px 12px", borderBottom: `1px solid ${C.border}`, fontSize: 13, fontFamily: F, color: C.text };
+  return (
+    <Modal open onClose={onClose} title={`Pedido #${o.orderNumber} — ${o.client}`} width={680}>
+      <div data-order-view={o.id}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 16 }}>
+          <span style={{ fontSize: 12, fontWeight: 800, padding: "4px 12px", borderRadius: 4, background: sc + "22", color: sc, border: `1px solid ${sc}66`, fontFamily: FH, letterSpacing: "0.06em", textTransform: "uppercase" }}>{o.status === "planning" ? "Em planejamento" : STATUS_LABEL[o.status] || o.status}</span>
+          {late && <span style={{ fontSize: 12, fontWeight: 800, padding: "4px 12px", borderRadius: 4, background: C.dangerDim, color: C.danger, fontFamily: FH, letterSpacing: "0.06em" }}>ATRASADO</span>}
+          <span style={{ marginLeft: "auto", fontSize: 11, fontWeight: 700, padding: "3px 10px", borderRadius: 4, background: C.darkInput, color: C.textMuted, fontFamily: FH, letterSpacing: "0.06em", textTransform: "uppercase" }}>Somente visualização</span>
+        </div>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 14 }}>
+          <div><div style={lbl}>Entrega</div><div style={{ ...val, color: late ? C.danger : C.text }}>{fmtDateFull(o.deliveryDate) || "—"}</div></div>
+          <div><div style={lbl}>Produção</div><div style={val}>{days.length ? (days.length === 1 ? fmtDateFull(days[0].date) : `${fmtDate(days[0].date)} a ${fmtDate(days[days.length - 1].date)}`) : "A definir"}</div></div>
+          <div><div style={lbl}>Tempo total</div><div style={val}>{items.length ? fmtSec(orderTotalTime(o)) : "—"}</div></div>
+          {o.status === "completed" && <div><div style={lbl}>Localização</div><div style={val}>{logi.location || "—"}</div></div>}
+          {o.status === "completed" && <div><div style={lbl}>Faturado</div><div style={val}>{logi.invoiced ? `Sim${logi.invoiceDate ? " · " + fmtDateFull(logi.invoiceDate) : ""}` : "Não"}</div></div>}
+          {o.status === "completed" && <div><div style={lbl}>Coletado</div><div style={val}>{logi.collected ? "Sim" : "Não"}</div></div>}
+        </div>
+        {o.status === "cancelled" && o.cancelReason && <div style={{ marginTop: 14, fontSize: 13, color: C.textMuted, fontFamily: F }}><strong style={{ color: C.text }}>Motivo do cancelamento:</strong> {o.cancelReason}</div>}
+        {o.observations && <div style={{ marginTop: 14, fontSize: 13, color: C.textMuted, fontFamily: F, whiteSpace: "pre-line" }}><strong style={{ color: C.text }}>Observações:</strong> {o.observations}</div>}
+
+        <div style={sec}>Itens ({items.length})</div>
+        {items.length === 0
+          ? <div style={{ padding: 16, borderRadius: 8, background: C.orangeDim, color: C.orange, fontSize: 13, fontFamily: F, fontWeight: 600 }}>Pedido aguardando planejamento — itens e dias de produção ainda não definidos.</div>
+          : <div style={{ borderRadius: 8, border: `1px solid ${C.border}`, overflow: "hidden" }}>
+              <div style={{ ...row, gridTemplateColumns: "150px 1fr 50px 80px 80px", fontSize: 10, fontWeight: 700, color: C.textDim, fontFamily: FH, textTransform: "uppercase", letterSpacing: "0.06em" }}><span>Código</span><span>Descrição</span><span>Qtd</span><span>Tempo</span><span>Pronto</span></div>
+              {items.map(i => { const done = !!(o.itemsCompleted || {})[i.code]; return (
+                <div key={i.code} style={{ ...row, gridTemplateColumns: "150px 1fr 50px 80px 80px" }}>
+                  <span style={{ fontWeight: 800, color: C.red }}>{i.code}</span>
+                  <span style={{ color: C.textMuted, fontSize: 12 }}>{i.description}</span>
+                  <span style={{ fontWeight: 700 }}>{i.quantity}</span>
+                  <span style={{ color: C.textMuted, fontSize: 12 }}>{fmtSec(i.productionTime)}</span>
+                  <span style={{ fontWeight: 800, fontFamily: FH, color: done ? C.green : C.textDim }}>{done ? "SIM" : "NÃO"}</span>
+                </div>
+              ); })}
+            </div>}
+
+        {days.length > 1 && <>
+          <div style={sec}>Dias de produção</div>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+            {days.map(d => <span key={d.date} style={{ padding: "5px 10px", borderRadius: 5, background: C.darkInput, border: `1px solid ${C.border}`, fontSize: 12, fontFamily: F, color: C.text }}>{fmtDate(d.date)} · <span style={{ color: C.textMuted }}>{fmtSec(d.minutes)}</span></span>)}
+          </div>
+        </>}
+
+        {missing.length > 0 && <>
+          <div style={sec}>Itens faltantes ({missing.length})</div>
+          <div style={{ borderRadius: 8, border: `1px solid ${C.border}`, overflow: "hidden" }}>
+            {missing.map(m => (
+              <div key={m.code} style={{ ...row, gridTemplateColumns: "1fr 60px 110px" }}>
+                <span style={{ fontWeight: 800 }}>{m.code}</span>
+                <span style={{ fontWeight: 700 }}>{m.qty}</span>
+                <span style={{ fontWeight: 800, fontFamily: FH, color: m.delivered ? C.green : C.orange }}>{m.delivered ? "ENTREGUE" : "PENDENTE"}</span>
+              </div>
+            ))}
+          </div>
+        </>}
+
+        <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 22 }}><Btn variant="ghost" onClick={onClose}>Fechar</Btn></div>
+      </div>
+    </Modal>
+  );
+}
+
+// ============================================================
 // MOTIVO — modal com texto obrigatório (cancelar, pausar, trocar entrega, reativar)
 // ============================================================
 function ReasonModal({ open, title, message, confirmLabel = "Confirmar", confirmColor = C.red, onConfirm, onCancel }) {
@@ -497,7 +574,7 @@ function LoginPage({ users, onLogin }) {
             </div>
           </div>
           <div style={{ textAlign: "center", marginTop: 12, fontSize: 10, color: C.textDim, fontFamily: F }}>
-            v1.5.1
+            v1.5.2
           </div>
         </div>
       </div>
@@ -1159,7 +1236,7 @@ function DemandPage({ orders, addOrder, updateOrder, deleteOrder, cancelOrder, c
 // ============================================================
 // PAGE 2: CALENDÁRIO DE PRODUÇÃO
 // ============================================================
-function CalendarPage({ orders, updateOrder, calendarSettings, saveCalendarSettings, dayOverrides, saveDayOverrides, setEditingOrderId, setActivePage, logistics }) {
+function CalendarPage({ orders, updateOrder, calendarSettings, saveCalendarSettings, dayOverrides, saveDayOverrides, setEditingOrderId, setActivePage, logistics, readOnly = false }) {
   const [weekOffset, setWeekOffset] = useState(0);
   const [showSettings, setShowSettings] = useState(false);
   const [showDayConfig, setShowDayConfig] = useState(null);
@@ -1196,8 +1273,11 @@ function CalendarPage({ orders, updateOrder, calendarSettings, saveCalendarSetti
   function isOverCapacity(ds) { const h = getHoursForDay(ds); return h > 0 && getDaySeconds(ds) > h * 3600; }
   function occColor(pct) { if (pct <= 60) return { bg: C.greenDim, text: C.green }; if (pct <= 75) return { bg: C.yellowDim, text: C.yellow }; if (pct <= 90) return { bg: C.orangeDim, text: C.orange }; return { bg: C.dangerDim, text: C.danger }; }
 
+  // Fila de planejamento: sem dia de produção ainda, aparece na faixa acima do calendário
+  const planningOrders = orders.filter(o => o.status === "planning").sort((a, b) => (a.deliveryDate || "9999").localeCompare(b.deliveryDate || "9999"));
+
   function handleDrop(ds) {
-    if (!drag) return;
+    if (!drag || readOnly) return;
     const o = orders.find(x => x.id === drag.id); const d = drag; setDrag(null); setArmed(null);
     if (!o) return;
     const before = normalizeDays(effectiveDays(o));
@@ -1220,10 +1300,12 @@ function CalendarPage({ orders, updateOrder, calendarSettings, saveCalendarSetti
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
           <h1 style={{ margin: 0, fontSize: 26, fontWeight: 800, color: C.text, fontFamily: FH, letterSpacing: "0.02em" }}>Calendário de Produção</h1>
-          <button onClick={() => setShowSettings(true)} title="Configurações" style={{ width: 34, height: 34, borderRadius: 6, border: `1px solid ${C.border}`, background: C.darkCard, color: C.textMuted, cursor: "pointer", fontSize: 17, display: "flex", alignItems: "center", justifyContent: "center" }}>⚙</button>
+          {!readOnly && <button onClick={() => setShowSettings(true)} title="Configurações" style={{ width: 34, height: 34, borderRadius: 6, border: `1px solid ${C.border}`, background: C.darkCard, color: C.textMuted, cursor: "pointer", fontSize: 17, display: "flex", alignItems: "center", justifyContent: "center" }}>⚙</button>}
+          {readOnly && <span style={{ fontSize: 11, fontWeight: 700, padding: "3px 10px", borderRadius: 4, background: C.darkInput, color: C.textMuted, fontFamily: FH, letterSpacing: "0.06em", textTransform: "uppercase" }}>Somente visualização</span>}
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
           <div style={{ display: "flex", gap: 12, fontSize: 11, fontFamily: FH, fontWeight: 700, letterSpacing: "0.04em" }}>
+            <span style={{ display: "flex", alignItems: "center", gap: 5 }}><span style={{ width: 10, height: 10, borderRadius: 2, background: C.orangeDim, border: `2px solid ${C.orange}` }} /><span style={{ color: C.textMuted }}>Em planejamento</span></span>
             <span style={{ display: "flex", alignItems: "center", gap: 5 }}><span style={{ width: 10, height: 10, borderRadius: 2, background: C.redDim, border: `2px solid ${C.red}` }} /><span style={{ color: C.textMuted }}>Ativo</span></span>
             <span style={{ display: "flex", alignItems: "center", gap: 5 }}><span style={{ width: 10, height: 10, borderRadius: 2, background: C.yellowDim, border: `2px solid ${C.yellow}` }} /><span style={{ color: C.textMuted }}>Em execução</span></span>
             <span style={{ display: "flex", alignItems: "center", gap: 5 }}><span style={{ width: 10, height: 10, borderRadius: 2, background: C.blueDim, border: `2px solid ${C.blue}` }} /><span style={{ color: C.textMuted }}>Pronto</span></span>
@@ -1237,8 +1319,30 @@ function CalendarPage({ orders, updateOrder, calendarSettings, saveCalendarSetti
         </div>
       </div>
       <div style={{ fontSize: 11, color: C.textDim, fontFamily: F, marginBottom: 10 }}>
-        Arrastar = move só a parte daquele dia (divide a produção) · <strong style={{ color: C.textMuted }}>Dois cliques no pedido e depois arrastar</strong> = move o pedido inteiro para um dia · ✎ = abrir pedido
+        {readOnly
+          ? <><strong style={{ color: C.textMuted }}>Dois cliques no pedido</strong> (ou ✎) = ver os itens do pedido</>
+          : <>Arrastar = move só a parte daquele dia (divide a produção) · <strong style={{ color: C.textMuted }}>Dois cliques no pedido e depois arrastar</strong> = move o pedido inteiro para um dia · ✎ = abrir pedido</>}
       </div>
+
+      {planningOrders.length > 0 && (
+        <div data-planning-strip style={{ marginBottom: 10, padding: "8px 12px", borderRadius: 8, background: C.orangeDim, border: `1px solid ${C.orange}55`, display: "flex", alignItems: "flex-start", gap: 12 }}>
+          <div style={{ fontSize: 11, fontWeight: 800, color: C.orange, fontFamily: FH, textTransform: "uppercase", letterSpacing: "0.06em", whiteSpace: "nowrap", paddingTop: 5 }}>🗂 Em planejamento ({planningOrders.length})</div>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 6, flex: 1, maxHeight: 84, overflowY: "auto" }}>
+            {planningOrders.map(o => {
+              const late = o.deliveryDate && o.deliveryDate < getToday();
+              return (
+                <div key={o.id} data-planning-card={o.id} onClick={() => !readOnly && openEdit(o.id)} onDoubleClick={() => readOnly && openEdit(o.id)}
+                  title={readOnly ? "Dois cliques para ver o pedido" : "Clique para planejar (definir itens e dias)"}
+                  style={{ padding: "4px 9px", borderRadius: 5, background: C.darkCard, borderLeft: `3px solid ${C.orange}`, cursor: "pointer", fontSize: 10, fontFamily: F, fontWeight: 600, color: C.text, userSelect: "none", whiteSpace: "nowrap" }}>
+                  <span style={{ fontWeight: 800, color: C.orange }}>{o.client}</span>
+                  <span style={{ color: C.textMuted, marginLeft: 5 }}>#{o.orderNumber}</span>
+                  <span style={{ marginLeft: 6, fontWeight: 800, color: late ? C.danger : C.textMuted }}>· entrega {o.deliveryDate ? fmtDate(o.deliveryDate) : "—"}{late ? " (atrasado)" : ""}</span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
 
       <div style={{ flex: 1, overflow: "auto" }}>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(6, 1fr)", gap: 6, marginBottom: 6 }}>
@@ -1251,14 +1355,14 @@ function CalendarPage({ orders, updateOrder, calendarSettings, saveCalendarSetti
               const isToday = ds === getToday(); const isSat = di === 5;
               const off = isSat && !calendarSettings.saturdayEnabled && dayOverrides[ds] === undefined;
               return (
-                <div key={di} data-day={ds} onDragOver={e => { e.preventDefault(); e.currentTarget.style.boxShadow = `inset 0 0 0 2px ${drag?.whole ? C.red : C.steel}`; }} onDragLeave={e => { e.currentTarget.style.boxShadow = "none"; }} onDrop={e => { e.preventDefault(); e.currentTarget.style.boxShadow = "none"; handleDrop(ds); }}
+                <div key={di} data-day={ds} onDragOver={e => { if (readOnly) return; e.preventDefault(); e.currentTarget.style.boxShadow = `inset 0 0 0 2px ${drag?.whole ? C.red : C.steel}`; }} onDragLeave={e => { e.currentTarget.style.boxShadow = "none"; }} onDrop={e => { e.preventDefault(); e.currentTarget.style.boxShadow = "none"; handleDrop(ds); }}
                   style={{ background: off ? C.dark : C.darkCard, borderRadius: 8, border: `1px solid ${isToday ? C.red : C.border}`, padding: 8, minHeight: 110, opacity: off ? 0.35 : 1, transition: "all 0.12s" }}>
                   <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 5 }}>
                     <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
                       <span style={{ fontSize: 13, fontWeight: 800, color: isToday ? C.red : C.text, fontFamily: FH }}>{fmtDate(ds)}</span>
                       {!off && h > 0 && <span style={{ fontSize: 10, fontWeight: 700, padding: "1px 6px", borderRadius: 4, background: oc.bg, color: oc.text, fontFamily: FH }}>{occ}%</span>}
                     </div>
-                    <button onClick={() => { setShowDayConfig(ds); setDayConfigHours(getHoursForDay(ds)); }} style={{ background: "none", border: "none", color: C.textDim, cursor: "pointer", fontSize: 13, padding: 0 }}>⋯</button>
+                    {!readOnly && <button onClick={() => { setShowDayConfig(ds); setDayConfigHours(getHoursForDay(ds)); }} style={{ background: "none", border: "none", color: C.textDim, cursor: "pointer", fontSize: 13, padding: 0 }}>⋯</button>}
                   </div>
                   {!off && isOverCapacity(ds) && <CapacityBanner compact />}
                   {getOrdersForDay(ds).map(o => {
@@ -1270,16 +1374,16 @@ function CalendarPage({ orders, updateOrder, calendarSettings, saveCalendarSetti
                     const cardBg = isCollected ? C.greenDim : isCompleted ? C.blueDim : isExec ? C.yellowDim : C.redDim;
                     const nDays = effectiveDays(o).length;
                     const key = `${o.id}|${ds}`;
-                    const movable = o.status !== "completed";
+                    const movable = !readOnly && o.status !== "completed";
                     return (
                       <div key={o.id} data-card={key} draggable={movable}
                         onMouseDown={e => { clickDetailRef.current = e.detail; if (armed && armed !== o.id) setArmed(null); }}
-                        onDoubleClick={() => movable && setArmed(o.id)}
+                        onDoubleClick={() => { if (readOnly) openEdit(o.id); else if (movable) setArmed(o.id); }}
                         onDragStart={e => { const whole = clickDetailRef.current >= 2 || armed === o.id; setDrag({ id: o.id, from: ds, whole }); try { e.dataTransfer.effectAllowed = "move"; e.dataTransfer.setData("text/plain", key); } catch {} }}
                         onDragEnd={() => setDrag(null)}
                         onMouseEnter={() => setHoverKey(key)} onMouseLeave={() => setHoverKey(k => k === key ? null : k)}
-                        title={movable ? "Arraste para mover esta parte · dois cliques e depois arraste para mover o pedido inteiro" : "Pedido concluído"}
-                        style={{ position: "relative", padding: "5px 22px 5px 8px", borderRadius: 5, background: cardBg, outline: armed === o.id ? `2px solid ${C.red}` : "none", boxShadow: armed === o.id ? `0 0 10px ${C.redGlow}` : "none", cursor: movable ? "grab" : "default", fontSize: 10, fontFamily: F, color: C.text, fontWeight: 600, borderLeft: `3px solid ${cardColor}`, marginBottom: 3, userSelect: "none" }}>
+                        title={readOnly ? "Dois cliques para ver os itens do pedido" : movable ? "Arraste para mover esta parte · dois cliques e depois arraste para mover o pedido inteiro" : "Pedido concluído"}
+                        style={{ position: "relative", padding: "5px 22px 5px 8px", borderRadius: 5, background: cardBg, outline: armed === o.id ? `2px solid ${C.red}` : "none", boxShadow: armed === o.id ? `0 0 10px ${C.redGlow}` : "none", cursor: readOnly ? "pointer" : movable ? "grab" : "default", fontSize: 10, fontFamily: F, color: C.text, fontWeight: 600, borderLeft: `3px solid ${cardColor}`, marginBottom: 3, userSelect: "none" }}>
                         <span style={{ fontWeight: 800, color: cardColor }}>{o.client}</span>
                         <span style={{ color: C.textMuted, marginLeft: 5 }}>#{o.orderNumber}</span>
                         {nDays > 1 && <span style={{ color: C.textMuted, marginLeft: 5, fontWeight: 700 }}>· {fmtSec(orderSecondsForDay(o, ds))}</span>}
@@ -2887,6 +2991,7 @@ export default function App() {
   const [calendarSettings, setCalendarSettings] = useState(defaultCalSettings);
   const [dayOverrides, setDayOverrides] = useState({});
   const [editingOrderId, setEditingOrderId] = useState(null);
+  const [viewOrderId, setViewOrderId] = useState(null);   // janela de consulta (vendedor)
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState(false);
   const [toasts, setToasts] = useState([]);
@@ -3413,7 +3518,7 @@ export default function App() {
   }
 
   function handleLogin(user) { setCurrentUser(user); setActivePage("demand"); }
-  function handleLogout() { setCurrentUser(null); setActivePage("demand"); }
+  function handleLogout() { setCurrentUser(null); setActivePage("demand"); setViewOrderId(null); }
 
   if (loading && users.length === 0) {
     return (
@@ -3453,9 +3558,17 @@ export default function App() {
     );
   }
 
+  // Vendedor não edita pedido já cadastrado: as telas chamam setEditingOrderId(id) + setActivePage("demand")
+  // para abrir um pedido — para ele, isso abre a janela de consulta e a navegação para a edição é ignorada.
+  const isVendedor = currentUser.role === "vendedor";
+  const openOrderId = id => { if (isVendedor && id) setViewOrderId(id); else setEditingOrderId(id); };
+  const goToPage = p => { if (isVendedor && p === "demand") return; setActivePage(p); };
+  const viewOrder = viewOrderId ? orders.find(o => o.id === viewOrderId) : null;
+
   return (
     <>
       <Toast toasts={toasts} />
+      {isVendedor && <OrderViewModal order={viewOrder} logistics={logistics} onClose={() => setViewOrderId(null)} />}
       {syncing && !offlineMode && (
         <div style={{ position: "fixed", top: 0, left: 0, right: 0, zIndex: 2000, background: C.darkCard, color: C.textMuted, padding: "5px 20px", fontSize: 11, fontWeight: 700, fontFamily: FH, letterSpacing: "0.04em", display: "flex", alignItems: "center", gap: 8, borderBottom: `1px solid ${C.border}` }}>
           <span style={{ display: "inline-block", width: 8, height: 8, borderRadius: "50%", background: C.green, animation: "pulse 1.2s ease-in-out infinite" }} />
@@ -3477,9 +3590,9 @@ export default function App() {
         <Sidebar activePage={activePage} setActivePage={p => { if (p !== "demand") setEditingOrderId(null); setActivePage(p); }} currentUser={currentUser} onLogout={handleLogout} badges={{ planning: orders.filter(o => o.status === "planning").length }} />
         <div style={{ flex: 1, overflow: "auto" }}>
           {activePage === "demand" && <DemandPage orders={orders} addOrder={addOrder} updateOrder={updateOrder} deleteOrder={currentUser.role === "gestor" ? deleteOrder : null} cancelOrder={cancelOrder} currentUser={currentUser} addItem={addItem} fetchEvents={fetchEvents} eventsVersion={eventsVersion} logistics={logistics} shift={shift} isWorkDay={isWorkDay} registeredItems={registeredItems} clientHistory={clientHistory} addClient={addClient} editingOrderId={editingOrderId} setEditingOrderId={setEditingOrderId} setActivePage={setActivePage} calendarSettings={calendarSettings} dayOverrides={dayOverrides} />}
-          {activePage === "calendar" && <CalendarPage orders={orders} updateOrder={updateOrder} calendarSettings={calendarSettings} saveCalendarSettings={saveCalendarSettings} dayOverrides={dayOverrides} saveDayOverrides={saveDayOverrides} setEditingOrderId={setEditingOrderId} setActivePage={setActivePage} logistics={logistics} />}
-          {activePage === "planning" && <PlanningPage orders={orders} currentUser={currentUser} setEditingOrderId={setEditingOrderId} setActivePage={setActivePage} reactivateOrder={reactivateOrder} deleteOrder={deleteOrder} fetchEvents={fetchEvents} eventsVersion={eventsVersion} logistics={logistics} shift={shift} isWorkDay={isWorkDay} />}
-          {activePage === "open" && <OpenDemandsPage orders={orders} updateOrder={updateOrder} setEditingOrderId={setEditingOrderId} setActivePage={setActivePage} logistics={logistics} saveLogistics={saveLogistics} currentUser={currentUser} startExecution={startExecution} pauseExecution={pauseExecution} completeOrder={completeOrder} startTimerOnly={startTimerOnly} shift={shift} isWorkDay={isWorkDay} />}
+          {activePage === "calendar" && <CalendarPage orders={orders} updateOrder={updateOrder} calendarSettings={calendarSettings} saveCalendarSettings={saveCalendarSettings} dayOverrides={dayOverrides} saveDayOverrides={saveDayOverrides} setEditingOrderId={openOrderId} setActivePage={goToPage} logistics={logistics} readOnly={isVendedor} />}
+          {activePage === "planning" && <PlanningPage orders={orders} currentUser={currentUser} setEditingOrderId={openOrderId} setActivePage={goToPage} reactivateOrder={reactivateOrder} deleteOrder={deleteOrder} fetchEvents={fetchEvents} eventsVersion={eventsVersion} logistics={logistics} shift={shift} isWorkDay={isWorkDay} />}
+          {activePage === "open" && <OpenDemandsPage orders={orders} updateOrder={updateOrder} setEditingOrderId={openOrderId} setActivePage={goToPage} logistics={logistics} saveLogistics={saveLogistics} currentUser={currentUser} startExecution={startExecution} pauseExecution={pauseExecution} completeOrder={completeOrder} startTimerOnly={startTimerOnly} shift={shift} isWorkDay={isWorkDay} />}
           {activePage === "logistics" && <LogisticsPage orders={orders} logistics={logistics} saveLogistics={saveLogistics} updateOrder={updateOrder} logEvent={logEvent} readOnly={currentUser.role === "vendedor"} />}
           {activePage === "missing" && (currentUser.role === "gestor" || currentUser.role === "montador") && <MissingItemsPage orders={orders} updateOrder={updateOrder} setEditingOrderId={setEditingOrderId} setActivePage={setActivePage} />}
           {activePage === "items" && (currentUser.role === "gestor" || currentUser.role === "montador") && <ItemsPage registeredItems={registeredItems} addItem={addItem} updateItem={updateItem} deleteItem={deleteItem} />}

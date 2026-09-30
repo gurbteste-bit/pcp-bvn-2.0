@@ -99,7 +99,58 @@ const isActiveOrder = o => o.status !== "cancelled";
 
 // ── Horas de um dia (calendário + exceções) ─────────────────
 // Domingo não tem expediente (não existe no cadastro de horas): antes caía no padrão de 8h e a distribuição automática agendava produção em domingo
-function hoursForDay(ds, calendarSettings, dayOverrides) { if (dayOverrides && dayOverrides[ds] !== undefined) return dayOverrides[ds]; const k = getDayKey(ds); return calendarSettings[k] ?? (k === "domingo" ? 0 : 8); }
+// Feriado ativo = 0h. Exceção explícita do dia (⋯ no Calendário) vale mais que tudo — é assim que se programa produção num feriado trabalhado.
+function hoursForDay(ds, calendarSettings, dayOverrides) {
+  if (dayOverrides && dayOverrides[ds] !== undefined) return dayOverrides[ds];
+  if (activeHoliday(ds, calendarSettings)) return 0;
+  const k = getDayKey(ds); return calendarSettings[k] ?? (k === "domingo" ? 0 : 8);
+}
+
+// ── Feriados (calculados automaticamente para qualquer ano) ─
+function easterDate(y) {
+  const a = y % 19, b = Math.floor(y / 100), c = y % 100, d = Math.floor(b / 4), e = b % 4, f = Math.floor((b + 8) / 25), g = Math.floor((b - f + 1) / 3);
+  const h = (19 * a + b - d - g + 15) % 30, i = Math.floor(c / 4), k = c % 4, l = (32 + 2 * e + 2 * i - h - k) % 7, m = Math.floor((a + 11 * h + 22 * l) / 451);
+  const month = Math.floor((h + l - 7 * m + 114) / 31), day = ((h + l - 7 * m + 114) % 31) + 1;
+  return `${y}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+}
+const holidayCache = {};
+// optional = não é feriado nacional (ponto facultativo / estadual): começa como dia normal, o gestor marca como folga na ⚙
+function autoHolidays(y) {
+  if (holidayCache[y]) return holidayCache[y];
+  const e = easterDate(y);
+  const fixed = [["01-01", "Confraternização Universal"], ["04-21", "Tiradentes"], ["05-01", "Dia do Trabalho"], ["09-07", "Independência do Brasil"], ["10-12", "Nossa Senhora Aparecida"], ["11-02", "Finados"], ["11-15", "Proclamação da República"], ["11-20", "Dia da Consciência Negra"], ["12-25", "Natal"]]
+    .map(([md, name]) => ({ date: `${y}-${md}`, name, optional: false }));
+  const list = [...fixed,
+    { date: addDays(e, -2), name: "Sexta-feira Santa", optional: false },
+    { date: addDays(e, -48), name: "Carnaval (segunda)", optional: true },
+    { date: addDays(e, -47), name: "Carnaval (terça)", optional: true },
+    { date: addDays(e, 60), name: "Corpus Christi", optional: true },
+    { date: `${y}-09-20`, name: "Revolução Farroupilha (RS)", optional: true },
+  ].sort((a, b) => a.date.localeCompare(b.date));
+  return (holidayCache[y] = list);
+}
+// calendarSettings.holidays = { toggles: { "AAAA-MM-DD": true (folga) | false (trabalha) }, extra: [{ date, name }] (feriados municipais/da empresa) }
+function holidayInfo(ds, cs) {
+  if (!ds || !/^\d{4}-\d{2}-\d{2}$/.test(ds)) return null;
+  const hs = (cs && cs.holidays) || {};
+  const extra = (hs.extra || []).find(x => x.date === ds);
+  if (extra) return { date: ds, name: extra.name, custom: true, optional: false, on: true };
+  const a = autoHolidays(Number(ds.slice(0, 4))).find(x => x.date === ds);
+  if (!a) return null;
+  const t = (hs.toggles || {})[ds];
+  return { ...a, on: t !== undefined ? t : !a.optional };
+}
+function activeHoliday(ds, cs) { const h = holidayInfo(ds, cs); return h && h.on ? h : null; }
+// Por que o dia não tem expediente (para mensagens)
+function dayOffReason(ds, cs, ov) {
+  if (ov && ov[ds] !== undefined) return ov[ds] > 0 ? null : "dia marcado com 0h";
+  const h = activeHoliday(ds, cs); if (h) return `feriado — ${h.name}`;
+  const k = getDayKey(ds);
+  if (k === "domingo") return "domingo";
+  if (k === "sabado") return "sábado sem expediente";
+  return (cs[k] ?? 8) > 0 ? null : "dia sem horas no calendário";
+}
+function nextWorkDay(ds, cs, ov, skip = new Set()) { let d = ds, g = 0; while (g++ < 60 && (hoursForDay(d, cs, ov) <= 0 || skip.has(d))) d = addDays(d, 1); return d; }
 function orderTotalTime(o) { return (o.items || []).reduce((s, i) => s + (i.productionTime || 0), 0); }
 function orderSecondsForDay(o, ds) {
   if (o.productionDays && o.productionDays.length > 0) { const pd = o.productionDays.find(p => p.date === ds); return pd ? pd.minutes : 0; }
@@ -575,7 +626,7 @@ function LoginPage({ users, onLogin }) {
             </div>
           </div>
           <div style={{ textAlign: "center", marginTop: 12, fontSize: 10, color: C.textDim, fontFamily: F }}>
-            v1.5.3
+            v1.5.4
           </div>
         </div>
       </div>
@@ -765,7 +816,7 @@ function DemandPage({ orders, addOrder, updateOrder, deleteOrder, cancelOrder, c
     if (distMode === "equal") {
       const end = prodEnd && prodEnd >= prodStart ? prodEnd : prodStart;
       let days = getWorkDaysBetween(prodStart, end);
-      if (days.length === 0) days = [prodStart];
+      if (days.length === 0) days = [nextWorkDay(prodStart, calendarSettings, dayOverrides)];   // início/fim num domingo/feriado → 1º dia útil
       const per = Math.floor(totalProdTime / days.length);
       const rem = totalProdTime - per * days.length;
       setProductionDays(days.map((d, i) => ({ date: d, minutes: per + (i === days.length - 1 ? rem : 0) })));
@@ -788,7 +839,7 @@ function DemandPage({ orders, addOrder, updateOrder, deleteOrder, cancelOrder, c
 
   function addCustomDay() {
     const lastDate = productionDays.length ? productionDays[productionDays.length - 1].date : (prodStart || getToday());
-    const nextDate = productionDays.length ? addDays(lastDate, 1) : (prodStart || getToday());
+    const nextDate = nextWorkDay(productionDays.length ? addDays(lastDate, 1) : (prodStart || getToday()), calendarSettings, dayOverrides, new Set(productionDays.map(p => p.date)));
     setProductionDays([...productionDays, { date: nextDate, minutes: 0 }]);
   }
   function removeCustomDay(idx) { setProductionDays(productionDays.filter((_, i) => i !== idx)); }
@@ -801,6 +852,8 @@ function DemandPage({ orders, addOrder, updateOrder, deleteOrder, cancelOrder, c
   // Dias em que (outros pedidos + este) passam da capacidade — só aviso, não bloqueia
   function dayLoadPct(pd) { const h = getDayHours(pd.date); if (!pd.date || h <= 0) return null; return ((getOtherOrdersSecondsForDay(pd.date) + (pd.minutes || 0)) / (h * 3600)) * 100; }
   const overCapacityDays = productionDays.filter(pd => { const p = dayLoadPct(pd); return p !== null && p > 100; });
+  // Produção em domingo/feriado/dia sem horas não é permitida (dias passados de pedidos antigos são tolerados)
+  const offDayReason = pd => pd.date && (pd.minutes || 0) > 0 && pd.date >= getToday() ? dayOffReason(pd.date, calendarSettings, dayOverrides) : null;
 
   function handleProdStartChange(val) {
     if (deliveryDate && val > deliveryDate) {
@@ -900,6 +953,8 @@ function DemandPage({ orders, addOrder, updateOrder, deleteOrder, cancelOrder, c
     }
     const finalDays = hasItems ? normalizeDays(productionDays) : [];
     if (hasItems && finalDays.length === 0) return alert("A distribuição da produção está zerada.");
+    const offDays = finalDays.filter(offDayReason);
+    if (offDays.length) return alert(`Não é permitido programar produção em dia sem expediente:\n\n${offDays.map(d => `• ${getDayName(d.date)} ${fmtDateFull(d.date)} — ${offDayReason(d)}`).join("\n")}\n\nMova esses dias na Distribuição da Produção. (Se a empresa vai trabalhar nesse dia, o gestor libera as horas no ⋯ do dia no Calendário.)`);
     const finalDistTotal = finalDays.reduce((s, pd) => s + pd.minutes, 0);
     const mismatchWarning = hasItems && finalDistTotal !== totalProdTime ? `\n\nAtenção: o total distribuído (${fmtSec(finalDistTotal)}) é diferente do tempo total dos itens (${fmtSec(totalProdTime)}).` : "";
     const goesToPlanning = !hasItems;
@@ -1178,6 +1233,7 @@ function DemandPage({ orders, addOrder, updateOrder, deleteOrder, cancelOrder, c
                   {distMode === "personalizado" && (
                     <button onClick={() => removeCustomDay(idx)} style={{ background: "none", border: "none", color: C.danger, cursor: "pointer", fontSize: 14 }}>✕</button>
                   )}
+                  {offDayReason(pd) && <span data-offday-warning style={{ gridColumn: "1 / -1", fontSize: 11, color: C.danger, fontWeight: 800, fontFamily: FH }}>⛔ {getDayName(pd.date)} {fmtDate(pd.date)}: {offDayReason(pd)} — não é permitido programar produção neste dia</span>}
                   {(() => { const p = dayLoadPct(pd); return p !== null && p > 100 ? <span style={{ gridColumn: "1 / -1", fontSize: 11, color: C.danger, fontWeight: 700, fontFamily: FH }}>⚠ Dia com {Math.round(p)}% da capacidade (somando outros pedidos)</span> : null; })()}
                 </div>
               ))}
@@ -1277,13 +1333,43 @@ function CalendarPage({ orders, updateOrder, calendarSettings, saveCalendarSetti
   // Fila de planejamento: sem dia de produção ainda, aparece na faixa acima do calendário
   const planningOrders = orders.filter(o => o.status === "planning").sort((a, b) => (a.deliveryDate || "9999").localeCompare(b.deliveryDate || "9999"));
 
-  // A grade vai de segunda a sábado: produção programada em domingo ficaria invisível — avisa em vez de esconder
-  const hiddenSundays = calOrders.filter(o => o.status !== "completed").flatMap(o => effectiveDays(o).filter(d => d.date >= getToday() && getDayKey(d.date) === "domingo").map(d => ({ o, d })));
+  // Produção futura em dia sem expediente (domingo — que nem aparece na grade —, feriado, sábado fechado, dia com 0h).
+  // Não deveria mais acontecer (a tela bloqueia), mas pedidos antigos podem ter: avisa e oferece correção com 1 clique.
+  const isBadDay = d => d.date >= getToday() && (d.minutes || 0) > 0 && getHoursForDay(d.date) <= 0;
+  const offDayOrders = calOrders.filter(o => o.status !== "completed" && effectiveDays(o).some(isBadDay));
+  function fixOffDays(o) {
+    const days = normalizeDays(effectiveDays(o));
+    const used = new Set(days.filter(d => !isBadDay(d)).map(d => d.date));
+    const moves = [];
+    const next = days.map(d => { if (!isBadDay(d)) return d; const to = nextWorkDay(d.date, calendarSettings, dayOverrides, used); used.add(to); moves.push({ from: d.date, to, minutes: d.minutes }); return { ...d, date: to }; });
+    return { changes: daysToChanges(next), moves };
+  }
+  function requestFixOffDays(only) {
+    const plan = offDayOrders.filter(o => o.id === only).map(o => ({ o, ...fixOffDays(o) }));
+    const lines = plan.map(({ o, moves, changes }) => `#${o.orderNumber} ${o.client}: ${moves.map(m => `${fmtDate(m.from)} → ${fmtDate(m.to)} (${fmtSec(m.minutes)})`).join(", ")}${o.deliveryDate && changes.productionEnd > o.deliveryDate ? `\n   ⚠ a produção passa a terminar em ${fmtDate(changes.productionEnd)}, DEPOIS da entrega (${fmtDate(o.deliveryDate)})` : ""}`);
+    setFixConfirm({
+      message: `Mover a produção dos dias sem expediente para o próximo dia útil livre de cada pedido:\n\n${lines.join("\n")}\n\nConfirmar?`,
+      onYes: () => { setFixConfirm(null); plan.forEach(({ o, changes, moves }) => updateOrder(o.id, changes, { type: "reprogramado", details: { daysBefore: normalizeDays(effectiveDays(o)), daysAfter: changes.productionDays, mode: `dia sem expediente → próximo dia útil (${moves.map(m => `${fmtDate(m.from)}→${fmtDate(m.to)}`).join(", ")})` } })); },
+      onNo: () => setFixConfirm(null),
+    });
+  }
+  const [fixConfirm, setFixConfirm] = useState(null);
+  const [blockMsg, setBlockMsg] = useState(null);
+  useEffect(() => { if (!blockMsg) return; const t = setTimeout(() => setBlockMsg(null), 5000); return () => clearTimeout(t); }, [blockMsg]);
+  const [newHoliday, setNewHoliday] = useState({ date: "", name: "" });
+  const hol = calendarSettings.holidays || {};
+  const saveHolidays = h => saveCalendarSettings({ ...calendarSettings, holidays: { toggles: hol.toggles || {}, extra: hol.extra || [], ...h } });
+  const upcomingHolidays = (() => {
+    const t = getToday(), lim = addDays(t, 366), y = Number(t.slice(0, 4));
+    const auto = [...autoHolidays(y), ...autoHolidays(y + 1)].map(h => holidayInfo(h.date, calendarSettings)).filter(h => h && !h.custom);
+    return [...auto, ...(hol.extra || []).map(x => ({ ...x, custom: true, on: true }))].filter(h => h.date >= t && h.date <= lim).sort((a, b) => a.date.localeCompare(b.date));
+  })();
 
   function handleDrop(ds) {
     if (!drag || readOnly) return;
     const o = orders.find(x => x.id === drag.id); const d = drag; setDrag(null); setArmed(null);
     if (!o) return;
+    if (getHoursForDay(ds) <= 0) { setBlockMsg(`${getDayName(ds)} ${fmtDate(ds)} não tem expediente (${dayOffReason(ds, calendarSettings, dayOverrides) || "0h"}) — o pedido não foi movido. Para trabalhar nesse dia, libere as horas no ⋯ do dia.`); return; }
     const before = normalizeDays(effectiveDays(o));
     const ch = d.whole ? moveWhole(o, ds) : (d.from === ds ? null : movePortion(o, d.from, ds));
     if (!ch || JSON.stringify(ch.productionDays) === JSON.stringify(before)) return;
@@ -1328,9 +1414,21 @@ function CalendarPage({ orders, updateOrder, calendarSettings, saveCalendarSetti
           : <>Arrastar = move só a parte daquele dia (divide a produção) · <strong style={{ color: C.textMuted }}>Dois cliques no pedido e depois arrastar</strong> = move o pedido inteiro para um dia · ✎ = abrir pedido</>}
       </div>
 
-      {hiddenSundays.length > 0 && (
-        <div data-sunday-warning style={{ marginBottom: 10, padding: "8px 12px", borderRadius: 8, background: C.dangerDim, border: `1px solid ${C.danger}66`, color: C.danger, fontSize: 12, fontFamily: F, fontWeight: 700 }}>
-          ⚠ Produção programada em DOMINGO (não aparece na grade): {hiddenSundays.map(({ o, d }) => `${o.client} #${o.orderNumber} — ${fmtDate(d.date)} (${fmtSec(d.minutes)})`).join(" · ")}. {readOnly ? "Avise o gestor." : "Abra o pedido (✎) e mova esse dia."}
+      <ConfirmDialog open={!!fixConfirm} message={fixConfirm?.message || ""} onYes={fixConfirm?.onYes} onNo={fixConfirm?.onNo} />
+      {blockMsg && (
+        <div data-block-msg style={{ position: "fixed", top: 14, left: "50%", transform: "translateX(-50%)", zIndex: 1500, padding: "10px 20px", borderRadius: 20, background: C.danger, color: "#fff", fontFamily: FH, fontWeight: 800, fontSize: 13, letterSpacing: "0.03em", boxShadow: "0 8px 24px rgba(0,0,0,0.5)", maxWidth: "80vw", textAlign: "center" }}>
+          ⛔ {blockMsg}
+        </div>
+      )}
+      {offDayOrders.length > 0 && (
+        <div data-offday-banner style={{ marginBottom: 10, padding: "8px 12px", borderRadius: 8, background: C.dangerDim, border: `1px solid ${C.danger}66`, color: C.danger, fontSize: 12, fontFamily: F, fontWeight: 700 }}>
+          <div style={{ marginBottom: 4 }}>⚠ Produção programada em dia sem expediente{readOnly ? " — avise o gestor" : ""}:</div>
+          {offDayOrders.map(o => (
+            <div key={o.id} data-offday-order={o.id} style={{ display: "flex", alignItems: "center", gap: 10, padding: "3px 0", flexWrap: "wrap" }}>
+              <span style={{ flex: 1 }}>{o.client} #{o.orderNumber} — {effectiveDays(o).filter(isBadDay).map(d => `${getDayName(d.date).slice(0, 3)} ${fmtDate(d.date)} (${dayOffReason(d.date, calendarSettings, dayOverrides)}, ${fmtSec(d.minutes)})`).join(" · ")}</span>
+              {!readOnly && <button data-fix-offdays={o.id} onClick={() => requestFixOffDays(o.id)} style={{ padding: "4px 12px", borderRadius: 6, border: "none", background: C.danger, color: "#fff", cursor: "pointer", fontFamily: FH, fontWeight: 800, fontSize: 11, whiteSpace: "nowrap" }}>Mover para o próximo dia útil</button>}
+            </div>
+          ))}
         </div>
       )}
 
@@ -1362,11 +1460,14 @@ function CalendarPage({ orders, updateOrder, calendarSettings, saveCalendarSetti
           <div key={wi} style={{ display: "grid", gridTemplateColumns: "repeat(6, 1fr)", gap: 6, marginBottom: 6 }}>
             {week.map((ds, di) => {
               const h = getHoursForDay(ds); const occ = getOccupation(ds); const oc = occColor(occ);
-              const isToday = ds === getToday(); const isSat = di === 5;
-              const off = isSat && !calendarSettings.saturdayEnabled && dayOverrides[ds] === undefined;
+              const isToday = ds === getToday();
+              const off = h <= 0;   // sábado fechado, feriado ou dia com 0h (domingo nem aparece na grade)
+              const holi = activeHoliday(ds, calendarSettings);
+              const dayOrders = getOrdersForDay(ds);
+              const conflict = off && dayOrders.some(o => o.status !== "completed" && ds >= getToday());
               return (
-                <div key={di} data-day={ds} onDragOver={e => { if (readOnly) return; e.preventDefault(); e.currentTarget.style.boxShadow = `inset 0 0 0 2px ${drag?.whole ? C.red : C.steel}`; }} onDragLeave={e => { e.currentTarget.style.boxShadow = "none"; }} onDrop={e => { e.preventDefault(); e.currentTarget.style.boxShadow = "none"; handleDrop(ds); }}
-                  style={{ background: off ? C.dark : C.darkCard, borderRadius: 8, border: `1px solid ${isToday ? C.red : C.border}`, padding: 8, minHeight: 110, opacity: off ? 0.35 : 1, transition: "all 0.12s" }}>
+                <div key={di} data-day={ds} data-off={off ? "1" : undefined} onDragOver={e => { if (readOnly) return; e.preventDefault(); e.currentTarget.style.boxShadow = `inset 0 0 0 2px ${off ? C.danger : drag?.whole ? C.red : C.steel}`; }} onDragLeave={e => { e.currentTarget.style.boxShadow = "none"; }} onDrop={e => { e.preventDefault(); e.currentTarget.style.boxShadow = "none"; handleDrop(ds); }}
+                  style={{ background: off ? C.dark : C.darkCard, borderRadius: 8, border: `1px solid ${conflict ? C.danger : isToday ? C.red : C.border}`, padding: 8, minHeight: 110, opacity: off && !dayOrders.length ? 0.45 : 1, transition: "all 0.12s" }}>
                   <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 5 }}>
                     <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
                       <span style={{ fontSize: 13, fontWeight: 800, color: isToday ? C.red : C.text, fontFamily: FH }}>{fmtDate(ds)}</span>
@@ -1374,8 +1475,11 @@ function CalendarPage({ orders, updateOrder, calendarSettings, saveCalendarSetti
                     </div>
                     {!readOnly && <button onClick={() => { setShowDayConfig(ds); setDayConfigHours(getHoursForDay(ds)); }} style={{ background: "none", border: "none", color: C.textDim, cursor: "pointer", fontSize: 13, padding: 0 }}>⋯</button>}
                   </div>
+                  {holi && <div data-holiday={ds} style={{ fontSize: 9, fontWeight: 800, fontFamily: FH, color: C.orange, letterSpacing: "0.04em", textTransform: "uppercase", marginBottom: 4 }}>🎌 Feriado — {holi.name}</div>}
+                  {!holi && off && <div style={{ fontSize: 9, fontWeight: 800, fontFamily: FH, color: C.textDim, letterSpacing: "0.04em", textTransform: "uppercase", marginBottom: 4 }}>Sem expediente</div>}
+                  {conflict && <div style={{ fontSize: 9, fontWeight: 800, fontFamily: FH, color: C.danger, marginBottom: 4 }}>⛔ PRODUÇÃO EM DIA SEM EXPEDIENTE</div>}
                   {!off && isOverCapacity(ds) && <CapacityBanner compact />}
-                  {getOrdersForDay(ds).map(o => {
+                  {dayOrders.map(o => {
                     const logiData = (logistics || {})[String(o.id)] || {};
                     const isCollected = o.status === "completed" && logiData.collected;
                     const isCompleted = o.status === "completed" && !logiData.collected;
@@ -1441,6 +1545,32 @@ function CalendarPage({ orders, updateOrder, calendarSettings, saveCalendarSetti
           {Math.abs(shiftHours - (calendarSettings.segunda ?? 8)) > 0.01 && (
             <div style={{ marginTop: 12, fontSize: 12, color: C.yellow, fontFamily: F }}>⚠ O expediente de seg–sex soma {shiftHours.toLocaleString("pt-BR")}h, mas a capacidade de segunda está em {calendarSettings.segunda}h. Isso é normal se nem todo o expediente é produtivo — só confira se é intencional.</div>
           )}
+        </div>
+        <div data-holiday-settings style={{ paddingTop: 14, marginTop: 14, borderTop: `1px solid ${C.border}` }}>
+          <div style={{ fontSize: 12, fontWeight: 800, color: C.textDim, fontFamily: FH, textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 4 }}>Feriados (próximos 12 meses)</div>
+          <div style={{ fontSize: 12, color: C.textMuted, fontFamily: F, marginBottom: 10 }}>Feriados nacionais entram sozinhos todo ano. Em dia de <strong>Folga</strong> não é possível programar produção e o cronômetro não conta. Pontos facultativos começam como dia normal.</div>
+          <div style={{ maxHeight: 220, overflow: "auto", border: `1px solid ${C.border}`, borderRadius: 8 }}>
+            {upcomingHolidays.map(h => (
+              <div key={h.date} data-holiday-row={h.date} style={{ display: "grid", gridTemplateColumns: "92px 1fr 110px", gap: 8, alignItems: "center", padding: "6px 10px", borderBottom: `1px solid ${C.border}`, fontSize: 12, fontFamily: F, color: C.text }}>
+                <span style={{ fontWeight: 700 }}>{getDayName(h.date).slice(0, 3)} {fmtDate(h.date)}</span>
+                <span style={{ color: h.on ? C.text : C.textMuted }}>{h.name}{h.optional ? <span style={{ color: C.textDim }}> · facultativo</span> : null}{h.custom ? <span style={{ color: C.textDim }}> · da empresa</span> : null}</span>
+                {h.custom
+                  ? <button onClick={() => saveHolidays({ extra: (hol.extra || []).filter(x => x.date !== h.date) })} style={{ padding: "4px 8px", borderRadius: 5, border: `1px solid ${C.border}`, background: C.darkInput, color: C.danger, cursor: "pointer", fontFamily: FH, fontSize: 11, fontWeight: 700 }}>✕ Remover</button>
+                  : <button onClick={() => saveHolidays({ toggles: { ...(hol.toggles || {}), [h.date]: !h.on } })} style={{ padding: "4px 8px", borderRadius: 5, border: "none", background: h.on ? C.orange : C.darkInput, color: h.on ? "#fff" : C.textMuted, cursor: "pointer", fontFamily: FH, fontSize: 11, fontWeight: 700 }}>{h.on ? "Folga" : "Trabalha"}</button>}
+              </div>
+            ))}
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: "150px 1fr auto", gap: 8, marginTop: 10, alignItems: "end" }}>
+            <Field label="Data" style={{ marginBottom: 0 }}><input type="date" value={newHoliday.date} onChange={e => setNewHoliday({ ...newHoliday, date: e.target.value })} style={inputStyle} /></Field>
+            <Field label="Feriado municipal / da empresa" style={{ marginBottom: 0 }}><input value={newHoliday.name} onChange={e => setNewHoliday({ ...newHoliday, name: e.target.value })} placeholder="Ex: Aniversário da cidade" style={inputStyle} /></Field>
+            <Btn variant="ghost" onClick={() => {
+              const d = newHoliday.date, n = newHoliday.name.trim();
+              if (!d || !n) return alert("Informe a data e o nome do feriado.");
+              if ((hol.extra || []).some(x => x.date === d)) return alert("Já existe um feriado da empresa nessa data.");
+              saveHolidays({ extra: [...(hol.extra || []), { date: d, name: n }].sort((a, b) => a.date.localeCompare(b.date)) });
+              setNewHoliday({ date: "", name: "" });
+            }} style={{ padding: "10px 16px", fontSize: 12 }}>+ Adicionar</Btn>
+          </div>
         </div>
       </Modal>
 
@@ -1854,7 +1984,7 @@ function ReportsPage({ orders, registeredItems, calendarSettings, dayOverrides }
     if (o.productionDays && o.productionDays.length > 0) { const pd = o.productionDays.find(p => p.date === dt); return pd ? pd.minutes : 0; }
     return o.productionStart === dt ? o.items.reduce((s, i) => s + i.productionTime, 0) : 0;
   }
-  const occDays = []; for (let d = 0; d < 14; d++) { const dt = addDays(today, d); const dk = getDayKey(dt); const dw = new Date(dt + "T12:00:00").getDay(); if (dw === 0) continue; const h = dayOverrides[dt] !== undefined ? dayOverrides[dt] : (calendarSettings[dk] ?? 8); if (h === 0) continue; const m = orders.filter(isActiveOrder).reduce((s, o) => s + getOrderSecondsForDay(o, dt), 0); occDays.push({ date: dt, occ: Math.round((m / (h * 3600)) * 100) }); }
+  const occDays = []; for (let d = 0; d < 14; d++) { const dt = addDays(today, d); const h = hoursForDay(dt, calendarSettings, dayOverrides); if (h <= 0) continue; const m = orders.filter(isActiveOrder).reduce((s, o) => s + getOrderSecondsForDay(o, dt), 0); occDays.push({ date: dt, occ: Math.round((m / (h * 3600)) * 100) }); }
   const avgOcc = occDays.length ? Math.round(occDays.reduce((s, d) => s + d.occ, 0) / occDays.length) : 0;
 
   return (

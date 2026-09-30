@@ -98,7 +98,8 @@ const STATUS_COLOR = { planning: C.orange, scheduled: C.red, executing: C.yellow
 const isActiveOrder = o => o.status !== "cancelled";
 
 // ── Horas de um dia (calendário + exceções) ─────────────────
-function hoursForDay(ds, calendarSettings, dayOverrides) { if (dayOverrides && dayOverrides[ds] !== undefined) return dayOverrides[ds]; return calendarSettings[getDayKey(ds)] ?? 8; }
+// Domingo não tem expediente (não existe no cadastro de horas): antes caía no padrão de 8h e a distribuição automática agendava produção em domingo
+function hoursForDay(ds, calendarSettings, dayOverrides) { if (dayOverrides && dayOverrides[ds] !== undefined) return dayOverrides[ds]; const k = getDayKey(ds); return calendarSettings[k] ?? (k === "domingo" ? 0 : 8); }
 function orderTotalTime(o) { return (o.items || []).reduce((s, i) => s + (i.productionTime || 0), 0); }
 function orderSecondsForDay(o, ds) {
   if (o.productionDays && o.productionDays.length > 0) { const pd = o.productionDays.find(p => p.date === ds); return pd ? pd.minutes : 0; }
@@ -1276,6 +1277,9 @@ function CalendarPage({ orders, updateOrder, calendarSettings, saveCalendarSetti
   // Fila de planejamento: sem dia de produção ainda, aparece na faixa acima do calendário
   const planningOrders = orders.filter(o => o.status === "planning").sort((a, b) => (a.deliveryDate || "9999").localeCompare(b.deliveryDate || "9999"));
 
+  // A grade vai de segunda a sábado: produção programada em domingo ficaria invisível — avisa em vez de esconder
+  const hiddenSundays = calOrders.filter(o => o.status !== "completed").flatMap(o => effectiveDays(o).filter(d => d.date >= getToday() && getDayKey(d.date) === "domingo").map(d => ({ o, d })));
+
   function handleDrop(ds) {
     if (!drag || readOnly) return;
     const o = orders.find(x => x.id === drag.id); const d = drag; setDrag(null); setArmed(null);
@@ -1323,6 +1327,12 @@ function CalendarPage({ orders, updateOrder, calendarSettings, saveCalendarSetti
           ? <><strong style={{ color: C.textMuted }}>Dois cliques no pedido</strong> (ou ✎) = ver os itens do pedido</>
           : <>Arrastar = move só a parte daquele dia (divide a produção) · <strong style={{ color: C.textMuted }}>Dois cliques no pedido e depois arrastar</strong> = move o pedido inteiro para um dia · ✎ = abrir pedido</>}
       </div>
+
+      {hiddenSundays.length > 0 && (
+        <div data-sunday-warning style={{ marginBottom: 10, padding: "8px 12px", borderRadius: 8, background: C.dangerDim, border: `1px solid ${C.danger}66`, color: C.danger, fontSize: 12, fontFamily: F, fontWeight: 700 }}>
+          ⚠ Produção programada em DOMINGO (não aparece na grade): {hiddenSundays.map(({ o, d }) => `${o.client} #${o.orderNumber} — ${fmtDate(d.date)} (${fmtSec(d.minutes)})`).join(" · ")}. {readOnly ? "Avise o gestor." : "Abra o pedido (✎) e mova esse dia."}
+        </div>
+      )}
 
       {planningOrders.length > 0 && (
         <div data-planning-strip style={{ marginBottom: 10, padding: "8px 12px", borderRadius: 8, background: C.orangeDim, border: `1px solid ${C.orange}55`, display: "flex", alignItems: "flex-start", gap: 12 }}>

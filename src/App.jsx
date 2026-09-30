@@ -575,7 +575,7 @@ function LoginPage({ users, onLogin }) {
             </div>
           </div>
           <div style={{ textAlign: "center", marginTop: 12, fontSize: 10, color: C.textDim, fontFamily: F }}>
-            v1.5.2
+            v1.5.3
           </div>
         </div>
       </div>
@@ -3100,6 +3100,7 @@ export default function App() {
       execSessions: o.exec_sessions || [], execSeconds: o.exec_seconds ?? null, execWallSeconds: o.exec_wall_seconds ?? null,
       cancelReason: o.cancel_reason || '', cancelledAt: o.cancelled_at || null, cancelledBy: o.cancelled_by || '',
       originalDeliveryDate: o.original_delivery_date || null,
+      updatedAt: o.updated_at || null,   // carimbo usado pela atualização automática para achar o que mudou
     };
   }
   // Campos JS → colunas do Supabase
@@ -3122,6 +3123,7 @@ export default function App() {
       db.complementary_complete = changes.missingItems.length === 0 || changes.missingItems.every(i => i.delivered);
     }
     if (missingColsRef.current) NEW_COLS.forEach(c => delete db[c]);
+    if (Object.keys(db).length) db.updated_at = new Date().toISOString();   // o banco não atualiza sozinho (sem trigger)
     return db;
   }
   const isMissingColErr = e => e && (e.code === 'PGRST204' || /column .* does not exist|Could not find the .* column/i.test(e.message || ''));
@@ -3295,8 +3297,9 @@ export default function App() {
         .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'client_history' }, payload => {
           setClientHistory(prev => prev.includes(payload.new.name) ? prev : [...prev, payload.new.name]);
         })
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'settings' }, () => { refreshData(); })
         .subscribe((status) => {
-          if (status === 'SUBSCRIBED') console.log('✓ Realtime sync conectado');
+          if (status === 'SUBSCRIBED') { console.log('✓ Realtime sync conectado'); refreshData(); }   // ao (re)conectar, busca o que perdeu
         });
       subscription = channel;
     };
@@ -3308,6 +3311,82 @@ export default function App() {
         supabase.removeChannel(subscription);
       }
     };
+  }, []);
+
+  // ── Atualização automática em segundo plano ─────────────────────────────────
+  // O Realtime depende de configuração no Supabase e perde eventos quando a aba dorme ou a rede cai; por isso o app
+  // também confere o servidor a cada 30s (aba visível) e ao voltar para a aba. Não recarrega a página: só troca os
+  // dados que mudaram, então formulário em preenchimento não é perdido.
+  // Ciclo leve: só id+carimbo dos pedidos e busca as linhas que mudaram. A cada 20 ciclos (~10 min): carga completa.
+  const ordersRef = useRef(orders);
+  useEffect(() => { ordersRef.current = orders; }, [orders]);
+  const stateChangedAtRef = useRef(0);
+  useEffect(() => { stateChangedAtRef.current = Date.now(); }, [orders, registeredItems, clientHistory, calendarSettings, dayOverrides, logistics, users]);
+  const refreshBusyRef = useRef(false);
+  const refreshCountRef = useRef(0);
+  const [lastRefresh, setLastRefresh] = useState(null);
+
+  async function refreshData() {
+    if (!syncedRef.current || offlineModeRef.current || refreshBusyRef.current) return;
+    if (Date.now() - stateChangedAtRef.current < 4000) return;   // gravação local possivelmente em andamento — tenta no próximo ciclo
+    refreshBusyRef.current = true;
+    const t0 = Date.now();
+    const keepIfSame = next => prev => JSON.stringify(prev) === JSON.stringify(next) ? prev : next;
+    try {
+      const heavy = refreshCountRef.current++ % 20 === 0;
+      const [ordRes, setRes, cliRes, usrRes, itRes] = await Promise.all([
+        heavy ? supabase.from('orders').select('*') : supabase.from('orders').select('id,updated_at'),
+        supabase.from('settings').select('*'),
+        supabase.from('client_history').select('name'),
+        supabase.from('users').select('*'),
+        heavy ? supabase.from('items').select('*') : Promise.resolve(null),
+      ]);
+      if (ordRes.error || setRes.error) return;
+      let fullRows = heavy ? ordRes.data : null, changedRows = [];
+      if (!heavy) {
+        const local = new Map(ordersRef.current.map(o => [String(o.id), o.updatedAt]));
+        const need = ordRes.data.filter(r => local.get(String(r.id)) !== r.updated_at).map(r => r.id);
+        if (need.length > 80) { const r = await supabase.from('orders').select('*'); if (r.error) return; fullRows = r.data; }
+        else if (need.length) { const r = await supabase.from('orders').select('*').in('id', need); if (r.error) return; changedRows = r.data; }
+      }
+      if (stateChangedAtRef.current > t0) return;   // algo mudou aqui durante a busca — não sobrescreve
+      const remoteIds = new Set((fullRows || ordRes.data).map(r => String(r.id)));
+      const isFreshLocal = o => Number(o.id) > Date.now() - 120000;   // pedido recém-criado aqui, gravação talvez ainda a caminho
+      setOrders(prev => {
+        let next;
+        if (fullRows) { next = fullRows.map(mapOrder); prev.forEach(o => { if (!remoteIds.has(String(o.id)) && isFreshLocal(o)) next.push(o); }); return keepIfSame(next)(prev); }
+        const changed = new Map(changedRows.map(r => [String(r.id), mapOrder(r)]));
+        const removed = prev.some(o => !remoteIds.has(String(o.id)) && !isFreshLocal(o));
+        if (!changed.size && !removed) return prev;
+        next = prev.filter(o => remoteIds.has(String(o.id)) || isFreshLocal(o)).map(o => changed.get(String(o.id)) || o);
+        const have = new Set(next.map(o => String(o.id)));
+        changed.forEach((o, id) => { if (!have.has(id)) next.push(o); });
+        return next;
+      });
+      const calRow = setRes.data.find(r => r.key === 'calendar'), overRow = setRes.data.find(r => r.key === 'day_overrides'), logRow = setRes.data.find(r => r.key === 'logistics');
+      if (calRow) setCalendarSettings(keepIfSame(calRow.value));
+      if (overRow) setDayOverrides(keepIfSame(overRow.value || {}));
+      if (logRow) setLogistics(keepIfSame(logRow.value || {}));
+      if (!cliRes.error && cliRes.data) setClientHistory(keepIfSame(cliRes.data.map(c => c.name)));
+      if (!usrRes.error && usrRes.data && usrRes.data.length > 0) setUsers(keepIfSame(usrRes.data.map(mapUser)));
+      if (itRes && !itRes.error && itRes.data && itRes.data.length > 0) setRegisteredItems(keepIfSame(itRes.data.map(mapItem)));
+      LS.set(LSK.sync, new Date().toISOString());
+      setLastRefresh(new Date());
+    } catch (e) {
+      console.warn('Atualização automática falhou (tenta de novo no próximo ciclo):', e);
+    } finally {
+      refreshBusyRef.current = false;
+    }
+  }
+  const refreshDataRef = useRef(refreshData);
+  refreshDataRef.current = refreshData;
+  useEffect(() => {
+    const run = () => { if (document.visibilityState === 'visible') refreshDataRef.current(); };
+    const t = setInterval(run, 30000);
+    document.addEventListener('visibilitychange', run);
+    window.addEventListener('focus', run);
+    window.addEventListener('online', run);
+    return () => { clearInterval(t); document.removeEventListener('visibilitychange', run); window.removeEventListener('focus', run); window.removeEventListener('online', run); };
   }, []);
 
   async function addOrder(order) {
@@ -3459,7 +3538,7 @@ export default function App() {
     const affected = orders.filter(o => o.client === from);
     setOrders(p => p.map(o => o.client === from ? { ...o, client: to } : o));
     setClientHistory(p => { const s = p.filter(c => c !== from); return s.includes(to) ? s : [...s, to]; });
-    const r1 = await supabase.from('orders').update({ client: to }).eq('client', from);
+    const r1 = await supabase.from('orders').update({ client: to, updated_at: new Date().toISOString() }).eq('client', from);
     if (r1.error) { handleSaveError(r1.error, () => loadData(), "Erro ao renomear cliente nos pedidos."); return; }
     await supabase.from('client_history').insert({ name: to }).then(() => {});
     await supabase.from('client_history').delete().eq('name', from);
@@ -3578,6 +3657,11 @@ export default function App() {
   return (
     <>
       <Toast toasts={toasts} />
+      {lastRefresh && !offlineMode && (
+        <div data-last-refresh title="O app confere o servidor sozinho a cada 30 segundos — não precisa recarregar a página" style={{ position: "fixed", right: 10, bottom: 4, zIndex: 900, fontSize: 10, color: C.textDim, fontFamily: F, pointerEvents: "auto", userSelect: "none" }}>
+          ● atualizado {String(lastRefresh.getHours()).padStart(2, "0")}:{String(lastRefresh.getMinutes()).padStart(2, "0")}:{String(lastRefresh.getSeconds()).padStart(2, "0")}
+        </div>
+      )}
       {isVendedor && <OrderViewModal order={viewOrder} logistics={logistics} onClose={() => setViewOrderId(null)} />}
       {syncing && !offlineMode && (
         <div style={{ position: "fixed", top: 0, left: 0, right: 0, zIndex: 2000, background: C.darkCard, color: C.textMuted, padding: "5px 20px", fontSize: 11, fontWeight: 700, fontFamily: FH, letterSpacing: "0.04em", display: "flex", alignItems: "center", gap: 8, borderBottom: `1px solid ${C.border}` }}>

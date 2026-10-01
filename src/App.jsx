@@ -626,7 +626,7 @@ function LoginPage({ users, onLogin }) {
             </div>
           </div>
           <div style={{ textAlign: "center", marginTop: 12, fontSize: 10, color: C.textDim, fontFamily: F }}>
-            v1.5.4
+            v1.5.5
           </div>
         </div>
       </div>
@@ -1724,7 +1724,7 @@ function OpenDemandsPage({ orders, updateOrder, setEditingOrderId, setActivePage
     const { orderId, location } = deliverModal;
     completeOrder(orderId, location.trim());
     const existing = (logistics || {})[String(orderId)] || {};
-    if (saveLogistics) saveLogistics({ ...(logistics || {}), [String(orderId)]: { ...existing, completionDate: getToday(), location: location.trim() } });
+    if (saveLogistics) saveLogistics({ [String(orderId)]: { ...existing, completionDate: getToday(), location: location.trim() } });
     setSelectedExec(null);
     setDeliverModal(null);
   }
@@ -2336,7 +2336,7 @@ function LogisticsPage({ orders, logistics, saveLogistics, updateOrder, logEvent
   }
   function updateLogi(orderId, changes) {
     const curr = getLogi(orderId);
-    saveLogistics({ ...logistics, [String(orderId)]: { ...curr, ...changes } });
+    saveLogistics({ [String(orderId)]: { ...curr, ...changes } });
   }
   function hasNoMissingParts(o) {
     return (o.missingItems || []).every(m => m.delivered);
@@ -3365,6 +3365,16 @@ export default function App() {
       } else if (cached.users && cached.users.length > 0) {
         setUsers(cached.users);
       }
+      // ponto de partida da atualização automática (evita baixar tudo de novo no primeiro ciclo)
+      if (ordersRes.data) {
+        knownOrderIdsRef.current = new Set(ordersRes.data.map(r => String(r.id)));
+        orderStampRef.current = Math.max(0, ...ordersRes.data.map(r => Date.parse(r.updated_at) || 0));
+      }
+      itemCountRef.current = itemsRes.data?.length || 0;
+      itemStampRef.current = Math.max(0, ...(itemsRes.data || []).map(r => Date.parse(r.updated_at) || 0));
+      if (settingsRes.data) settingsRes.data.forEach(r => { settingsStampRef.current[r.key] = r.updated_at; });
+      serverStampsRef.current = itemsRes.data?.[0] ? 'updated_at' in itemsRes.data[0] : false;
+      lastFullRef.current = Date.now();
       syncedRef.current = true;
       setOfflineMode(false);
       setLoading(false);
@@ -3447,72 +3457,181 @@ export default function App() {
   // O Realtime depende de configuração no Supabase e perde eventos quando a aba dorme ou a rede cai; por isso o app
   // também confere o servidor a cada 30s (aba visível) e ao voltar para a aba. Não recarrega a página: só troca os
   // dados que mudaram, então formulário em preenchimento não é perdido.
-  // Ciclo leve: só id+carimbo dos pedidos e busca as linhas que mudaram. A cada 20 ciclos (~10 min): carga completa.
+  //
+  // v1.5.5: o carimbo updated_at passou a ser gravado pelo PRÓPRIO BANCO (trigger do script supabase_v1.5.5.sql).
+  // Antes dependia do app — e computadores com versão antiga em cache gravavam sem carimbo, então as mudanças
+  // deles nunca eram detectadas pelos outros (#82538 concluído e #82860 iniciado em 01/10 não apareceram).
+  // Com o carimbo do banco ("modo carimbo"), cada ciclo pede só o que mudou desde o último carimbo visto
+  // (+ contagem de pedidos, para pegar exclusões). Sem o script aplicado ("modo compatível"), compara
+  // id+carimbo como antes e faz carga completa a cada 3 min — assim nada fica mais de 3 min desatualizado.
   const ordersRef = useRef(orders);
   useEffect(() => { ordersRef.current = orders; }, [orders]);
+  const logisticsRef = useRef(logistics);
+  useEffect(() => { logisticsRef.current = logistics; }, [logistics]);
   const stateChangedAtRef = useRef(0);
   useEffect(() => { stateChangedAtRef.current = Date.now(); }, [orders, registeredItems, clientHistory, calendarSettings, dayOverrides, logistics, users]);
-  const refreshBusyRef = useRef(false);
-  const refreshCountRef = useRef(0);
+  const refreshBusyRef = useRef(0);          // início (ms) do ciclo em andamento; 0 = livre
+  const refreshGenRef = useRef(0);
+  const serverStampsRef = useRef(false);      // banco carimba updated_at sozinho (script v1.5.5 aplicado)
+  const lastFullRef = useRef(0);              // última carga completa (ms)
+  const orderStampRef = useRef(0);            // maior updated_at de pedido já recebido (ms, relógio do servidor)
+  const itemStampRef = useRef(0);
+  const knownOrderIdsRef = useRef(new Set()); // ids que o servidor já confirmou (para detectar exclusões pela contagem)
+  const itemCountRef = useRef(0);
+  const settingsStampRef = useRef({});
   const [lastRefresh, setLastRefresh] = useState(null);
 
-  async function refreshData() {
-    if (!syncedRef.current || offlineModeRef.current || refreshBusyRef.current) return;
-    if (Date.now() - stateChangedAtRef.current < 4000) return;   // gravação local possivelmente em andamento — tenta no próximo ciclo
-    refreshBusyRef.current = true;
+  async function refreshData(forceFull = false) {
+    const skip = why => { const d = window.__pcpSync = window.__pcpSync || {}; d.skips = { ...(d.skips || {}), [why]: ((d.skips || {})[why] || 0) + 1 }; d.lastSkip = why; d.lastSkipAt = new Date().toISOString(); };
+    const busy = refreshBusyRef.current && Date.now() - refreshBusyRef.current < 45000;   // ciclo travado na rede há >45 s é abandonado
+    if (!syncedRef.current || offlineModeRef.current || busy) return skip(!syncedRef.current ? 'sem carga inicial' : offlineModeRef.current ? 'offline' : 'ocupado');
+    if (!forceFull && Date.now() - stateChangedAtRef.current < 4000) return skip('alteração local recente');   // gravação local possivelmente em andamento — tenta no próximo ciclo
+    refreshBusyRef.current = Date.now();
+    const gen = ++refreshGenRef.current;
+    const stale = () => gen !== refreshGenRef.current;   // um ciclo mais novo já assumiu
+    (window.__pcpSync = window.__pcpSync || {}).startedAt = new Date().toISOString();
     const t0 = Date.now();
     const keepIfSame = next => prev => JSON.stringify(prev) === JSON.stringify(next) ? prev : next;
+    const stampMs = s => { const t = s ? Date.parse(s) : NaN; return isNaN(t) ? 0 : t; };
+    const since = ms => new Date(Math.max(0, ms - 5 * 60000)).toISOString();   // 5 min de folga: cobre gravações que terminaram fora de ordem
     try {
-      const heavy = refreshCountRef.current++ % 20 === 0;
-      const [ordRes, setRes, cliRes, usrRes, itRes] = await Promise.all([
-        heavy ? supabase.from('orders').select('*') : supabase.from('orders').select('id,updated_at'),
-        supabase.from('settings').select('*'),
+      const full = forceFull || Date.now() - lastFullRef.current > (serverStampsRef.current ? 30 : 3) * 60000;
+      if (full) {   // confere se o script v1.5.5 já está no banco (o app passa a usar o modo carimbo sem precisar recarregar)
+        const probe = await supabase.from('items').select('updated_at').limit(1);
+        serverStampsRef.current = !probe.error;
+      }
+      const stamps = serverStampsRef.current;
+      const [ordRes, cntRes, setRes, cliRes, usrRes, itRes, itCntRes] = await Promise.all([
+        full ? supabase.from('orders').select('*')
+          : stamps ? supabase.from('orders').select('*').gt('updated_at', since(orderStampRef.current))
+          : supabase.from('orders').select('id,updated_at'),
+        !full && stamps ? supabase.from('orders').select('id', { count: 'exact', head: true }) : Promise.resolve(null),
+        full || !stamps ? supabase.from('settings').select('*') : supabase.from('settings').select('key,updated_at'),
         supabase.from('client_history').select('name'),
         supabase.from('users').select('*'),
-        heavy ? supabase.from('items').select('*') : Promise.resolve(null),
+        full ? supabase.from('items').select('*') : stamps ? supabase.from('items').select('*').gt('updated_at', since(itemStampRef.current)) : Promise.resolve(null),
+        !full && stamps ? supabase.from('items').select('code', { count: 'exact', head: true }) : Promise.resolve(null),
       ]);
-      if (ordRes.error || setRes.error) return;
-      let fullRows = heavy ? ordRes.data : null, changedRows = [];
-      if (!heavy) {
+      if (ordRes.error || setRes.error || cntRes?.error) { const e = ordRes.error || setRes.error || cntRes?.error; console.warn('Atualização automática: servidor respondeu com erro', e); return skip('erro servidor: ' + (e.message || e.code || '?').slice(0, 80)); }
+
+      // ── pedidos ──
+      let fullRows = full ? ordRes.data : null, changedRows = [], idList = null;
+      if (!full && stamps) {
+        changedRows = ordRes.data;
+        const known = new Set(knownOrderIdsRef.current); changedRows.forEach(r => known.add(String(r.id)));
+        if (cntRes.count !== known.size) {   // pedido excluído (ou criado sem carimbo novo): confere a lista de ids
+          const r = await supabase.from('orders').select('id,updated_at'); if (r.error) return skip('erro servidor: ' + (r.error.message || '').slice(0, 80));
+          idList = r.data;
+          const have = new Set(ordersRef.current.map(o => String(o.id))); changedRows.forEach(x => have.add(String(x.id)));
+          const missing = idList.filter(x => !have.has(String(x.id))).map(x => x.id);
+          if (missing.length) { const m = await supabase.from('orders').select('*').in('id', missing); if (m.error) return skip('erro servidor: ' + (m.error.message || '').slice(0, 80)); changedRows = [...changedRows, ...m.data]; }
+        }
+      } else if (!full) {
+        idList = ordRes.data;
         const local = new Map(ordersRef.current.map(o => [String(o.id), o.updatedAt]));
-        const need = ordRes.data.filter(r => local.get(String(r.id)) !== r.updated_at).map(r => r.id);
-        if (need.length > 80) { const r = await supabase.from('orders').select('*'); if (r.error) return; fullRows = r.data; }
-        else if (need.length) { const r = await supabase.from('orders').select('*').in('id', need); if (r.error) return; changedRows = r.data; }
+        const need = idList.filter(r => local.get(String(r.id)) !== r.updated_at).map(r => r.id);
+        if (need.length > 80) { const r = await supabase.from('orders').select('*'); if (r.error) return skip('erro servidor: ' + (r.error.message || '').slice(0, 80)); fullRows = r.data; }
+        else if (need.length) { const r = await supabase.from('orders').select('*').in('id', need); if (r.error) return skip('erro servidor: ' + (r.error.message || '').slice(0, 80)); changedRows = r.data; }
       }
-      if (stateChangedAtRef.current > t0) return;   // algo mudou aqui durante a busca — não sobrescreve
-      const remoteIds = new Set((fullRows || ordRes.data).map(r => String(r.id)));
+
+      // ── configurações (logística, calendário, exceções) ──
+      let settingsRows = setRes.data;
+      if (!full && stamps) {
+        const changedKeys = setRes.data.filter(r => settingsStampRef.current[r.key] !== r.updated_at).map(r => r.key);
+        settingsRows = [];
+        if (changedKeys.length) { const r = await supabase.from('settings').select('*').in('key', changedKeys); if (r.error) return skip('erro servidor: ' + (r.error.message || '').slice(0, 80)); settingsRows = r.data; }
+      }
+
+      if (stale()) return;
+      if (!forceFull && stateChangedAtRef.current > t0) return skip('alteração local durante a busca');   // algo mudou aqui durante a busca — não sobrescreve (tenta no próximo ciclo)
+
       const isFreshLocal = o => Number(o.id) > Date.now() - 120000;   // pedido recém-criado aqui, gravação talvez ainda a caminho
+      const remoteIds = fullRows ? new Set(fullRows.map(r => String(r.id))) : idList ? new Set(idList.map(r => String(r.id))) : null;
       setOrders(prev => {
         let next;
         if (fullRows) { next = fullRows.map(mapOrder); prev.forEach(o => { if (!remoteIds.has(String(o.id)) && isFreshLocal(o)) next.push(o); }); return keepIfSame(next)(prev); }
         const changed = new Map(changedRows.map(r => [String(r.id), mapOrder(r)]));
-        const removed = prev.some(o => !remoteIds.has(String(o.id)) && !isFreshLocal(o));
-        if (!changed.size && !removed) return prev;
-        next = prev.filter(o => remoteIds.has(String(o.id)) || isFreshLocal(o)).map(o => changed.get(String(o.id)) || o);
+        const removed = remoteIds ? prev.some(o => !remoteIds.has(String(o.id)) && !isFreshLocal(o)) : false;
+        if (!removed && ![...changed].some(([id, o]) => { const p = prev.find(x => String(x.id) === id); return !p || JSON.stringify(p) !== JSON.stringify(o); })) return prev;
+        next = prev.filter(o => !remoteIds || remoteIds.has(String(o.id)) || isFreshLocal(o)).map(o => changed.get(String(o.id)) || o);
         const have = new Set(next.map(o => String(o.id)));
         changed.forEach((o, id) => { if (!have.has(id)) next.push(o); });
         return next;
       });
-      const calRow = setRes.data.find(r => r.key === 'calendar'), overRow = setRes.data.find(r => r.key === 'day_overrides'), logRow = setRes.data.find(r => r.key === 'logistics');
+      // memória do que o servidor já confirmou
+      const seenRows = fullRows || changedRows;
+      if (fullRows) knownOrderIdsRef.current = new Set(fullRows.map(r => String(r.id)));
+      else if (idList) knownOrderIdsRef.current = new Set(idList.map(r => String(r.id)));
+      else changedRows.forEach(r => knownOrderIdsRef.current.add(String(r.id)));
+      seenRows.forEach(r => { orderStampRef.current = Math.max(orderStampRef.current, stampMs(r.updated_at)); });
+
+      settingsRows.forEach(r => { settingsStampRef.current[r.key] = r.updated_at; });
+      const calRow = settingsRows.find(r => r.key === 'calendar'), overRow = settingsRows.find(r => r.key === 'day_overrides'), logRow = settingsRows.find(r => r.key === 'logistics');
       if (calRow) setCalendarSettings(keepIfSame(calRow.value));
       if (overRow) setDayOverrides(keepIfSame(overRow.value || {}));
-      if (logRow) setLogistics(keepIfSame(logRow.value || {}));
+      if (logRow) { setLogistics(keepIfSame(logRow.value || {})); LS.set(LSK.logistics, logRow.value || {}); }
+
       if (!cliRes.error && cliRes.data) setClientHistory(keepIfSame(cliRes.data.map(c => c.name)));
       if (!usrRes.error && usrRes.data && usrRes.data.length > 0) setUsers(keepIfSame(usrRes.data.map(mapUser)));
-      if (itRes && !itRes.error && itRes.data && itRes.data.length > 0) setRegisteredItems(keepIfSame(itRes.data.map(mapItem)));
+      if (itRes && !itRes.error && itRes.data) {
+        if (full) {
+          if (itRes.data.length > 0) { setRegisteredItems(keepIfSame(itRes.data.map(mapItem))); itemCountRef.current = itRes.data.length; }
+        } else if (itCntRes && !itCntRes.error && itCntRes.count !== itemCountRef.current) {
+          lastFullRef.current = 0;   // item excluído/renomeado: a próxima volta faz carga completa
+        } else if (itRes.data.length) {
+          const changed = new Map(itRes.data.map(r => [r.code, mapItem(r)]));
+          setRegisteredItems(prev => { const next = prev.map(i => changed.get(i.code) || i); const have = new Set(next.map(i => i.code)); changed.forEach((i, c) => { if (!have.has(c)) next.push(i); }); return keepIfSame(next)(prev); });
+        }
+        itRes.data.forEach(r => { itemStampRef.current = Math.max(itemStampRef.current, stampMs(r.updated_at)); });
+      }
+      if (full) lastFullRef.current = Date.now();
+      window.__pcpSync = { ...(window.__pcpSync || {}), ok: new Date().toISOString(), mode: stamps ? 'carimbo' : 'compatível', full, ms: Date.now() - t0, lastFull: new Date(lastFullRef.current).toISOString() };   // diagnóstico (console: __pcpSync)
       LS.set(LSK.sync, new Date().toISOString());
       setLastRefresh(new Date());
     } catch (e) {
-      console.warn('Atualização automática falhou (tenta de novo no próximo ciclo):', e);
+      console.warn('Atualização automática falhou (tenta de novo no próximo ciclo):', e); skip('exceção: ' + String(e?.message || e).slice(0, 80));
     } finally {
-      refreshBusyRef.current = false;
+      if (!stale()) refreshBusyRef.current = 0;
     }
   }
+  // ── Versão nova publicada? ─────────────────────────────────────────────────
+  // O PWA guarda o app em cache e, como a tela não precisa mais ser recarregada, um computador podia passar dias
+  // numa versão antiga. Confere /version.json a cada 5 min e ao voltar para a aba; se mudou, mostra faixa para atualizar.
+  const [newVersion, setNewVersion] = useState(false);
+  useEffect(() => {
+    if (!import.meta.env.PROD) return;
+    const check = async () => {
+      try {
+        const r = await fetch(`/version.json?t=${Date.now()}`, { cache: 'no-store' });
+        if (!r.ok) return;
+        const { build } = await r.json();
+        if (build && build !== __APP_BUILD__) setNewVersion(true);
+      } catch { /* sem rede: tenta depois */ }
+    };
+    check();
+    const t = setInterval(check, 5 * 60000);
+    const onVis = () => { if (document.visibilityState === 'visible') check(); };
+    document.addEventListener('visibilitychange', onVis);
+    return () => { clearInterval(t); document.removeEventListener('visibilitychange', onVis); };
+  }, []);
+  async function updateApp() {
+    try {
+      const reg = await navigator.serviceWorker?.getRegistration?.();
+      if (reg) {
+        await reg.update();
+        if (reg.installing || reg.waiting) {   // espera o service worker novo assumir (máx. 5 s)
+          await new Promise(res => { navigator.serviceWorker.addEventListener('controllerchange', res, { once: true }); setTimeout(res, 5000); });
+        }
+      }
+    } catch { /* recarrega mesmo assim */ }
+    window.location.reload();
+  }
+
   const refreshDataRef = useRef(refreshData);
   refreshDataRef.current = refreshData;
   useEffect(() => {
     const run = () => { if (document.visibilityState === 'visible') refreshDataRef.current(); };
-    const t = setInterval(run, 30000);
+    const t = setInterval(run, 15000);
     document.addEventListener('visibilitychange', run);
     window.addEventListener('focus', run);
     window.addEventListener('online', run);
@@ -3616,10 +3735,7 @@ export default function App() {
       return;
     }
     // Remove também o registro de logística órfão
-    if (logistics[String(id)]) {
-      const { [String(id)]: _removed, ...rest } = logistics;
-      saveLogistics(rest);
-    }
+    if (logistics[String(id)]) saveLogistics({}, [String(id)]);
     showToast(`Pedido #${prev.orderNumber} excluído.`, "success");
   }
   async function addItem(item) {
@@ -3694,10 +3810,27 @@ export default function App() {
     if (error) handleSaveError(error, () => setDayOverrides(prev), "Erro ao salvar exceções do calendário.");
   }
 
-  async function saveLogistics(newLogistics) {
-    setLogistics(newLogistics);
-    LS.set(LSK.logistics, newLogistics);
-    await supabase.from('settings').upsert({ key: 'logistics', value: newLogistics }, { onConflict: 'key' });
+  // Logística é um JSON único com todos os pedidos. Grava só o que mudou (patch por pedido + chaves removidas):
+  // regravar o bloco inteiro apagava a alteração que outro usuário tivesse feito nos últimos segundos.
+  async function saveLogistics(patch, remove = []) {
+    const apply = base => { const n = { ...(base || {}) }; remove.forEach(k => delete n[k]); return { ...n, ...patch }; };
+    const undo = {}; [...remove, ...Object.keys(patch)].forEach(k => { undo[k] = logisticsRef.current?.[k]; });
+    setLogistics(prev => { const n = apply(prev); LS.set(LSK.logistics, n); return n; });
+    let { data, error } = await supabase.rpc('settings_merge', { p_key: 'logistics', p_set: patch, p_remove: remove });
+    if (error && (error.code === 'PGRST202' || error.code === '42883' || /settings_merge/.test(error.message || ''))) {
+      // função do script v1.5.5 ainda não criada: lê o bloco atual do servidor, aplica só esta alteração e grava
+      const cur = await supabase.from('settings').select('value').eq('key', 'logistics').maybeSingle();
+      if (cur.error) error = cur.error;
+      else {
+        data = apply(cur.data?.value);
+        ({ error } = await supabase.from('settings').upsert({ key: 'logistics', value: data, updated_at: new Date().toISOString() }, { onConflict: 'key' }));
+      }
+    }
+    if (error) {
+      handleSaveError(error, () => setLogistics(prev => { const n = { ...prev }; Object.entries(undo).forEach(([k, v]) => { if (v === undefined) delete n[k]; else n[k] = v; }); return n; }), "Erro ao salvar dados de logística. Alteração desfeita.");
+      return;
+    }
+    if (data && typeof data === 'object') setLogistics(prev => { const n = JSON.stringify(prev) === JSON.stringify(data) ? prev : data; LS.set(LSK.logistics, n); return n; });
   }
 
   async function addUser(user) {
@@ -3788,8 +3921,14 @@ export default function App() {
     <>
       <Toast toasts={toasts} />
       {lastRefresh && !offlineMode && (
-        <div data-last-refresh title="O app confere o servidor sozinho a cada 30 segundos — não precisa recarregar a página" style={{ position: "fixed", right: 10, bottom: 4, zIndex: 900, fontSize: 10, color: C.textDim, fontFamily: F, pointerEvents: "auto", userSelect: "none" }}>
+        <div data-last-refresh title="O app confere o servidor sozinho a cada 15 segundos — não precisa recarregar a página" style={{ position: "fixed", right: 10, bottom: 4, zIndex: 900, fontSize: 10, color: C.textDim, fontFamily: F, pointerEvents: "auto", userSelect: "none" }}>
           ● atualizado {String(lastRefresh.getHours()).padStart(2, "0")}:{String(lastRefresh.getMinutes()).padStart(2, "0")}:{String(lastRefresh.getSeconds()).padStart(2, "0")}
+        </div>
+      )}
+      {newVersion && (
+        <div data-new-version style={{ position: "fixed", left: "50%", bottom: 16, transform: "translateX(-50%)", zIndex: 2100, background: C.red, color: "#fff", padding: "10px 14px 10px 18px", borderRadius: 10, boxShadow: "0 6px 24px rgba(0,0,0,.45)", display: "flex", alignItems: "center", gap: 14, fontFamily: FH, fontSize: 14, fontWeight: 800, letterSpacing: "0.03em" }}>
+          ⟳ Há uma versão nova do PCP. Atualize para continuar sincronizado com os outros usuários.
+          <button onClick={updateApp} style={{ background: "#fff", color: C.red, border: "none", borderRadius: 7, padding: "7px 14px", fontWeight: 900, fontFamily: FH, fontSize: 13, cursor: "pointer" }}>ATUALIZAR AGORA</button>
         </div>
       )}
       {isVendedor && <OrderViewModal order={viewOrder} logistics={logistics} onClose={() => setViewOrderId(null)} />}

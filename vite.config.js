@@ -2,7 +2,13 @@ import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 import { VitePWA } from 'vite-plugin-pwa'
 
+// Identificador do build: o app compara com /version.json do servidor para saber se há versão nova publicada
+const BUILD_ID = String(Date.now())
+
 export default defineConfig({
+  define: {
+    __APP_BUILD__: JSON.stringify(BUILD_ID),
+  },
   build: {
     target: 'es2020',
     minify: 'terser',
@@ -13,6 +19,12 @@ export default defineConfig({
     }
   },
   plugins: [
+    {
+      name: 'pcp-version-json',
+      generateBundle() {
+        this.emitFile({ type: 'asset', fileName: 'version.json', source: JSON.stringify({ build: BUILD_ID }) })
+      },
+    },
     react({
       jsxRuntime: 'automatic',
       babel: {

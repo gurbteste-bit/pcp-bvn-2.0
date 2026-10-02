@@ -9,3 +9,6 @@ supabase/.temp
 
 # Local Netlify folder
 .netlify
+
+# Claude Code — permissões locais (não versionar)
+.claude/settings.local.json

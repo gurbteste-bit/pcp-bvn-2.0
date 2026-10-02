@@ -300,7 +300,7 @@ function Btn({ children, onClick, variant = "primary", disabled, style: s }) {
 // ============================================================
 // CONSULTA DE PEDIDO — janela somente leitura (vendedor não edita pedido já cadastrado)
 // ============================================================
-function OrderViewModal({ order, logistics, onClose }) {
+function OrderViewModal({ order, logistics, parts = [], printOrderParts, onClose }) {
   if (!order) return null;
   const o = order;
   const logi = (logistics || {})[String(o.id)] || {};
@@ -353,6 +353,11 @@ function OrderViewModal({ order, logistics, onClose }) {
           <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
             {days.map(d => <span key={d.date} style={{ padding: "5px 10px", borderRadius: 5, background: C.darkInput, border: `1px solid ${C.border}`, fontSize: 12, fontFamily: F, color: C.text }}>{fmtDate(d.date)} · <span style={{ color: C.textMuted }}>{fmtSec(d.minutes)}</span></span>)}
           </div>
+        </>}
+
+        {partsForOrder(parts, o).length > 0 && <>
+          <div style={sec}>⚑ Particularidades ({partsForOrder(parts, o).length})</div>
+          <OrderParticularities compact order={o} parts={parts} onPrint={printOrderParts ? () => printOrderParts(o) : null} />
         </>}
 
         {missing.length > 0 && <>
@@ -421,6 +426,7 @@ const EVENT_META = {
   reativado:            { label: "Pedido reativado", icon: "↺", color: C.orange },
   excluido:             { label: "Pedido excluído", icon: "🗑", color: C.danger },
   cliente_unificado:    { label: "Cliente renomeado/unificado", icon: "👥", color: C.textMuted },
+  particularidades:     { label: "Particularidades conferidas", icon: "⚑", color: C.orange },
 };
 // Texto legível dos detalhes de um evento (tela e CSV)
 function describeEvent(ev) {
@@ -443,6 +449,10 @@ function describeEvent(ev) {
   if (d.parallel && d.parallel.length) p.push(`Em paralelo com: ${d.parallel.join(", ")}`);
   if (d.status) p.push(`Status: ${STATUS_LABEL[d.status] || d.status}`);
   if (d.fromClient) p.push(`"${d.fromClient}" → "${d.toClient}"`);
+  if (ev.type === "particularidades") {
+    p.push(`${PART_STAGES[d.stage]?.label || d.stage}: ${d.ok || 0} OK`);
+    (d.notMet || []).forEach(n => p.push(`NÃO ATENDIDA — ${n.text} (motivo: ${n.reason})`));
+  }
   if (d.note) p.push(d.note);
   return p.join(" · ");
 }
@@ -506,6 +516,193 @@ function OrderHistory({ order, fetchEvents, eventsVersion, logistics, shift, isW
             </div>
           );
         })}
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// PARTICULARIDADES — regras de almoxarifado/montagem/expedição por CLIENTE ou por ITEM (item vale em qualquer cliente)
+// ============================================================
+const PART_SECTORS = [
+  { id: "almoxarifado", label: "Almoxarifado", icon: "📦", color: C.blue },
+  { id: "montagem",     label: "Montagem",     icon: "🔧", color: C.orange },
+  { id: "expedicao",    label: "Expedição",    icon: "🚚", color: C.green },
+  { id: "outros",       label: "Outros",       icon: "📝", color: C.steel },
+];
+const SECTOR_BY_ID = Object.fromEntries(PART_SECTORS.map(s => [s.id, s]));
+// Em cada etapa o popup mostra as particularidades dos setores dela que ainda NÃO foram conferidas neste pedido
+// (ex.: particularidade de item só aparece quando o item é lançado). No "Expedido" mostra TODAS (confirmação final).
+const PART_STAGES = {
+  cadastro:     { label: "Cadastro do pedido",            title: "Conferência do almoxarifado", sectors: ["almoxarifado", "outros"] },
+  planejamento: { label: "Itens lançados (planejamento)", title: "Conferência do almoxarifado", sectors: ["almoxarifado", "outros"] },
+  execucao:     { label: "Início da produção",            title: "Conferência da montagem",     sectors: ["montagem"] },
+  conclusao:    { label: "Transferência para expedição",  title: "Conferência da expedição",    sectors: ["expedicao"] },
+  expedido:     { label: "Conclusão (expedido)",          title: "Confirmação final — todas as particularidades", sectors: ["almoxarifado", "montagem", "expedicao", "outros"], all: true },
+};
+function partsForOrder(parts, o) {
+  if (!o) return [];
+  const codes = new Set((o.items || []).map(i => String(i.code || "").toUpperCase()));
+  return (parts || []).filter(p => p.active && (p.scope === "cliente" ? p.client === o.client : codes.has(p.itemCode)));
+}
+const sortParts = list => [...list].sort((a, b) =>
+  PART_SECTORS.findIndex(s => s.id === a.sector) - PART_SECTORS.findIndex(s => s.id === b.sector)
+  || (a.scope === b.scope ? 0 : a.scope === "cliente" ? -1 : 1) || (a.id - b.id));
+function partOrigin(p) { return p.scope === "cliente" ? "Cliente" : `Item ${p.itemCode}`; }
+// Última conferência de cada particularidade neste pedido: { [id]: { status, reason, stage, at, by } }
+function partLastChecks(o) {
+  const m = {};
+  (o?.particularityChecks || []).forEach(c => (c.items || []).forEach(i => { m[i.id] = { ...i, stage: c.stage, at: c.at, by: c.by }; }));
+  return m;
+}
+function partsPendingFor(parts, o, stage) {
+  const st = PART_STAGES[stage]; if (!st) return [];
+  const list = partsForOrder(parts, o).filter(p => st.sectors.includes(p.sector));
+  if (st.all) return sortParts(list);
+  const last = partLastChecks(o);
+  return sortParts(list.filter(p => !last[p.id]));
+}
+
+// Folha A4 para conferência física (impressa por um iframe oculto — não depende de pop-up liberado)
+const escHtml = s => String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+function printParticularities({ order, client, parts, user }) {
+  const list = sortParts(parts || []);
+  const last = order ? partLastChecks(order) : {};
+  const title = order ? `Pedido #${escHtml(order.orderNumber)}` : "Particularidades do cliente";
+  const head = order
+    ? `<div class="meta"><b>Cliente:</b> ${escHtml(order.client)} &nbsp;·&nbsp; <b>Entrega:</b> ${escHtml(fmtDateFull(order.deliveryDate) || "—")} &nbsp;·&nbsp; <b>Status:</b> ${escHtml(order.status === "planning" ? "Em planejamento" : STATUS_LABEL[order.status] || order.status || "")}</div>`
+    : `<div class="meta"><b>Cliente:</b> ${escHtml(client)}</div>`;
+  const items = order && (order.items || []).length
+    ? `<h2>Itens do pedido</h2><table class="items"><tr><th>Código</th><th>Descrição</th><th>Qtd</th></tr>${order.items.map(i => `<tr><td><b>${escHtml(i.code)}</b></td><td>${escHtml(i.description)}</td><td>${escHtml(i.quantity)}</td></tr>`).join("")}</table>`
+    : order ? `<p class="obs">Itens ainda não lançados (pedido em planejamento) — particularidades de item aparecem quando os itens forem lançados.</p>` : "";
+  const sections = PART_SECTORS.map(s => {
+    const ps = list.filter(p => p.sector === s.id); if (!ps.length) return "";
+    return `<h2>${s.label} (${ps.length})</h2><table class="parts">${ps.map(p => {
+      const c = last[p.id];
+      const st = c ? `<div class="chk">Conferido: ${c.status === "ok" ? "OK" : "NÃO ATENDIDA — " + escHtml(c.reason)} · ${escHtml(c.by)} · ${escHtml(fmtDateTime(c.at))}</div>` : "";
+      return `<tr><td class="box">☐</td><td><div class="txt">${escHtml(p.description)}</div><div class="orig">${escHtml(partOrigin(p))}</div>${st}</td></tr>`;
+    }).join("")}</table>`;
+  }).join("") || `<p class="obs">Nenhuma particularidade cadastrada.</p>`;
+  const sign = order ? `<div class="sign">${["Almoxarifado", "Montagem", "Expedição"].map(l => `<div><div class="line"></div>${l} — nome / data</div>`).join("")}</div>` : "";
+  const html = `<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><title>Particularidades ${escHtml(order ? "#" + order.orderNumber : client)}</title><style>
+    @page { size: A4; margin: 14mm; } * { box-sizing: border-box; }
+    body { font-family: Arial, Helvetica, sans-serif; color: #111; font-size: 12px; margin: 0; }
+    .top { display: flex; justify-content: space-between; align-items: flex-end; border-bottom: 3px solid #C41230; padding-bottom: 6px; }
+    .brand { font-weight: 900; color: #C41230; font-size: 13px; letter-spacing: .05em; }
+    h1 { margin: 2px 0 0; font-size: 22px; } h2 { font-size: 14px; margin: 16px 0 6px; text-transform: uppercase; letter-spacing: .04em; border-bottom: 1px solid #999; padding-bottom: 3px; }
+    .meta { margin: 8px 0 2px; font-size: 13px; } .printed { font-size: 10px; color: #555; text-align: right; }
+    table { width: 100%; border-collapse: collapse; } td, th { padding: 6px 6px; vertical-align: top; border-bottom: 1px solid #ddd; text-align: left; }
+    th { font-size: 10px; text-transform: uppercase; color: #555; } .box { width: 28px; font-size: 20px; line-height: 1; }
+    .txt { font-size: 14px; font-weight: 700; } .orig { font-size: 10px; color: #555; margin-top: 2px; } .chk { font-size: 10px; color: #333; margin-top: 2px; font-style: italic; }
+    .obs { color: #555; font-style: italic; } tr { page-break-inside: avoid; }
+    .sign { display: flex; gap: 18px; margin-top: 36px; } .sign > div { flex: 1; font-size: 10px; color: #333; text-align: center; } .line { border-top: 1px solid #111; margin-bottom: 4px; height: 26px; }
+  </style></head><body>
+    <div class="top"><div><div class="brand">BVN HIDRÁULICA E PNEUMÁTICA · PARTICULARIDADES</div><h1>${title}</h1></div>
+    <div class="printed">Impresso em ${escHtml(fmtDateTime(new Date().toISOString()))}${user ? " por " + escHtml(user) : ""}</div></div>
+    ${head}${sections}${items}${sign}
+  </body></html>`;
+  try { window.__pcpLastPrint = html; } catch { /* diagnóstico */ }
+  const f = document.createElement("iframe");
+  f.setAttribute("data-print-frame", "");
+  f.style.cssText = "position:fixed;right:0;bottom:0;width:0;height:0;border:0;visibility:hidden";
+  document.body.appendChild(f);
+  const d = f.contentWindow.document; d.open(); d.write(html); d.close();
+  setTimeout(() => { try { f.contentWindow.focus(); f.contentWindow.print(); } catch (e) { console.warn("Impressão falhou:", e); } setTimeout(() => f.remove(), 60000); }, 300);
+}
+
+const partBadgeStyle = { fontSize: 10, fontWeight: 800, fontFamily: FH, padding: "2px 7px", borderRadius: 4, background: C.orangeDim, color: C.orange, border: `1px solid ${C.orange}66`, whiteSpace: "nowrap" };
+function PartBadge({ count, onClick, title }) {
+  if (!count) return null;
+  return <span data-part-badge={count} title={title || `${count} particularidade${count > 1 ? "s" : ""} — clique para ver`} onClick={onClick ? e => { e.stopPropagation(); onClick(); } : undefined} style={{ ...partBadgeStyle, cursor: onClick ? "pointer" : "default" }}>⚑ {count}</span>;
+}
+
+// Painel com as particularidades que valem para um pedido, por setor, com a situação da conferência
+function OrderParticularities({ order, parts, onPrint, compact = false, emptyText }) {
+  const list = sortParts(partsForOrder(parts, order));
+  const last = partLastChecks(order);
+  if (!list.length) return <div style={{ padding: compact ? "8px 0" : 16, color: C.textDim, fontSize: 13, fontFamily: F }}>{emptyText || "Nenhuma particularidade para este cliente ou para os itens deste pedido."}</div>;
+  return (
+    <div data-order-parts={order?.id || ""}>
+      {onPrint && <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 8 }}><Btn variant="ghost" onClick={onPrint} style={{ padding: "6px 14px", fontSize: 12 }}>🖨 Imprimir particularidades</Btn></div>}
+      {PART_SECTORS.map(s => {
+        const ps = list.filter(p => p.sector === s.id); if (!ps.length) return null;
+        return (
+          <div key={s.id} style={{ marginBottom: compact ? 8 : 14 }}>
+            <div style={{ fontSize: 11, fontWeight: 800, color: s.color, fontFamily: FH, textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 4 }}>{s.icon} {s.label} ({ps.length})</div>
+            {ps.map(p => {
+              const c = last[p.id];
+              return (
+                <div key={p.id} data-part-row={p.id} style={{ display: "flex", gap: 10, alignItems: "flex-start", padding: compact ? "5px 10px" : "8px 12px", marginBottom: 4, borderRadius: 6, background: C.dark, borderLeft: `3px solid ${s.color}` }}>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontSize: compact ? 13 : 14, color: C.text, fontFamily: F, fontWeight: 600, whiteSpace: "pre-line" }}>{p.description}</div>
+                    <div style={{ fontSize: 11, color: C.textDim, fontFamily: F, marginTop: 2 }}>{partOrigin(p)}</div>
+                  </div>
+                  {order?.id && <div style={{ fontSize: 11, fontFamily: FH, fontWeight: 700, textAlign: "right", whiteSpace: "nowrap", color: !c ? C.textDim : c.status === "ok" ? C.green : C.danger }} title={c?.reason || ""}>
+                    {!c ? "○ aguardando conferência" : c.status === "ok" ? `✓ OK · ${c.by} · ${fmtDateTime(c.at)}` : `✕ NÃO ATENDIDA · ${c.by}`}
+                    {c && c.status !== "ok" && <div style={{ fontWeight: 500, fontFamily: F, color: C.textMuted, maxWidth: 260, whiteSpace: "normal" }}>Motivo: {c.reason}</div>}
+                  </div>}
+                </div>
+              );
+            })}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// Popup obrigatório de conferência (cadastro, itens lançados, início da produção, expedição, expedido)
+function ParticularityGate({ gate, onConfirm, onCancel, onPrint }) {
+  const [ans, setAns] = useState({});   // id → { status: "ok" | "nao", reason }
+  useEffect(() => { setAns({}); }, [gate]);
+  if (!gate) return null;
+  const { order, stage, list } = gate; const st = PART_STAGES[stage];
+  const isDone = p => ans[p.id]?.status === "ok" || (ans[p.id]?.status === "nao" && (ans[p.id].reason || "").trim().length >= 3);
+  const done = list.filter(isDone).length; const ready = done === list.length;
+  const set = (id, v) => setAns(a => ({ ...a, [id]: { ...(a[id] || {}), ...v } }));
+  const confirm = () => ready && onConfirm(list.map(p => ({ id: p.id, sector: p.sector, scope: p.scope, ref: p.scope === "cliente" ? p.client : p.itemCode, text: p.description, status: ans[p.id].status, ...(ans[p.id].status === "nao" ? { reason: ans[p.id].reason.trim() } : {}) })));
+  const btn = (on, color) => ({ padding: "7px 14px", borderRadius: 6, border: `1px solid ${on ? color : C.border}`, background: on ? color : C.darkInput, color: on ? "#fff" : C.textMuted, cursor: "pointer", fontFamily: FH, fontSize: 13, fontWeight: 800, whiteSpace: "nowrap" });
+  return (
+    <div data-part-gate={stage} style={{ position: "fixed", inset: 0, zIndex: 3000, background: "rgba(0,0,0,0.78)", backdropFilter: "blur(6px)", display: "flex", alignItems: "center", justifyContent: "center" }}>
+      <div style={{ background: C.darkCard, borderRadius: 12, border: `2px solid ${C.orange}`, width: 760, maxWidth: "94vw", maxHeight: "90vh", display: "flex", flexDirection: "column", boxShadow: "0 30px 80px rgba(0,0,0,0.7)" }}>
+        <div style={{ padding: "16px 24px", borderBottom: `1px solid ${C.border}`, background: C.orangeDim, borderRadius: "10px 10px 0 0" }}>
+          <div style={{ fontSize: 12, fontWeight: 800, color: C.orange, fontFamily: FH, letterSpacing: "0.08em", textTransform: "uppercase" }}>⚑ Particularidades — {st.label}</div>
+          <div style={{ fontSize: 22, fontWeight: 800, color: C.text, fontFamily: FH, marginTop: 2 }}>{st.title}</div>
+          <div style={{ fontSize: 14, color: C.text, fontFamily: F, marginTop: 4 }}><strong style={{ color: C.red }}>#{order.orderNumber}</strong> · {order.client}</div>
+          <div style={{ fontSize: 12, color: C.textMuted, fontFamily: F, marginTop: 6 }}>
+            {st.all ? "Confirme que TODAS as particularidades deste pedido foram atendidas." : "Este cliente/itens têm particularidades para o seu setor. Confira cada uma e marque OK."} Se alguma não pôde ser atendida, marque <strong>Não atendida</strong> e explique — fica registrado no histórico do pedido.
+          </div>
+        </div>
+        <div style={{ padding: "14px 24px", overflow: "auto", flex: 1 }}>
+          {PART_SECTORS.map(s => {
+            const ps = list.filter(p => p.sector === s.id); if (!ps.length) return null;
+            return (
+              <div key={s.id} style={{ marginBottom: 14 }}>
+                <div style={{ fontSize: 12, fontWeight: 800, color: s.color, fontFamily: FH, textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 6 }}>{s.icon} {s.label}</div>
+                {ps.map(p => { const a = ans[p.id] || {}; return (
+                  <div key={p.id} data-gate-row={p.id} style={{ padding: "10px 12px", marginBottom: 6, borderRadius: 8, background: C.dark, border: `1px solid ${isDone(p) ? (a.status === "ok" ? C.green : C.danger) + "88" : C.border}`, borderLeft: `4px solid ${s.color}` }}>
+                    <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
+                      <div style={{ flex: 1 }}>
+                        <div style={{ fontSize: 15, color: C.text, fontFamily: F, fontWeight: 700, whiteSpace: "pre-line" }}>{p.description}</div>
+                        <div style={{ fontSize: 11, color: C.textDim, fontFamily: F, marginTop: 2 }}>{partOrigin(p)}</div>
+                      </div>
+                      <button data-gate-ok={p.id} onClick={() => set(p.id, { status: "ok" })} style={btn(a.status === "ok", C.green)}>✓ OK</button>
+                      <button data-gate-nao={p.id} onClick={() => set(p.id, { status: "nao" })} style={btn(a.status === "nao", C.danger)}>✕ Não atendida</button>
+                    </div>
+                    {a.status === "nao" && <input data-gate-reason={p.id} value={a.reason || ""} onChange={e => set(p.id, { reason: e.target.value })} placeholder="Por que não foi atendida? (obrigatório)" autoFocus style={{ ...inputStyle, marginTop: 8, borderColor: (a.reason || "").trim().length >= 3 ? C.border : C.danger }} />}
+                  </div>
+                ); })}
+              </div>
+            );
+          })}
+        </div>
+        <div style={{ padding: "14px 24px", borderTop: `1px solid ${C.border}`, display: "flex", gap: 10, alignItems: "center" }}>
+          <Btn variant="ghost" onClick={onPrint} style={{ padding: "10px 16px" }}>🖨 Imprimir</Btn>
+          <span style={{ fontSize: 12, color: ready ? C.green : C.textMuted, fontFamily: F, marginLeft: 6 }}>{done} de {list.length} conferida{list.length > 1 ? "s" : ""}</span>
+          <span style={{ marginLeft: "auto" }} />
+          <Btn variant="ghost" onClick={onCancel}>Cancelar</Btn>
+          <Btn variant="success" onClick={confirm} disabled={!ready}>✓ Confirmar conferência</Btn>
+        </div>
       </div>
     </div>
   );
@@ -626,7 +823,7 @@ function LoginPage({ users, onLogin }) {
             </div>
           </div>
           <div style={{ textAlign: "center", marginTop: 12, fontSize: 10, color: C.textDim, fontFamily: F }}>
-            v1.5.5
+            v1.6.0
           </div>
         </div>
       </div>
@@ -648,6 +845,7 @@ function Sidebar({ activePage, setActivePage, currentUser, onLogout, badges = {}
     { id: "items", icon: "📦", label: "Cadastro de Itens", roles: ["gestor", "montador"] },
     { id: "reports", icon: "📊", label: "Relatórios", roles: ["gestor"] },
     { id: "export", icon: "📤", label: "Exportação", roles: ["gestor"] },
+    { id: "particularities", icon: "⚑", label: "Particularidades", roles: ["gestor", "montador", "vendedor"] },
     { id: "clients", icon: "🏢", label: "Clientes", roles: ["gestor", "montador"] },
     { id: "users", icon: "👤", label: "Usuários", roles: ["gestor"] },
   ];
@@ -722,7 +920,7 @@ function Sidebar({ activePage, setActivePage, currentUser, onLogout, badges = {}
 // ============================================================
 // PAGE 1: DEMANDA DE PRODUÇÃO
 // ============================================================
-function DemandPage({ orders, addOrder, updateOrder, deleteOrder, cancelOrder, currentUser, registeredItems, addItem, clientHistory, addClient, editingOrderId, setEditingOrderId, setActivePage, calendarSettings, dayOverrides, fetchEvents, eventsVersion, logistics, shift, isWorkDay }) {
+function DemandPage({ parts = [], askParticularities, partChanges, partEvent, printOrderParts, orders, addOrder, updateOrder, deleteOrder, cancelOrder, currentUser, registeredItems, addItem, clientHistory, addClient, editingOrderId, setEditingOrderId, setActivePage, calendarSettings, dayOverrides, fetchEvents, eventsVersion, logistics, shift, isWorkDay }) {
   const isEditing = editingOrderId !== null;
   const editingOrder = isEditing ? orders.find(o => o.id === editingOrderId) : null;
   const [client, setClient] = useState(editingOrder?.client || "");
@@ -737,6 +935,7 @@ function DemandPage({ orders, addOrder, updateOrder, deleteOrder, cancelOrder, c
   const [showClientSugg, setShowClientSugg] = useState(false);
   const [showCodeSugg, setShowCodeSugg] = useState(false);
   const [confirm, setConfirm] = useState(null);
+  const [showDraftParts, setShowDraftParts] = useState(true);
   const [distMode, setDistMode] = useState(editingOrder?.productionDays?.length > 0 ? "personalizado" : "equal");
   const [productionDays, setProductionDays] = useState(editingOrder?.productionDays?.length ? [...editingOrder.productionDays] : []);
   const [missingItems, setMissingItems] = useState(editingOrder?.missingItems ? [...editingOrder.missingItems] : []);
@@ -960,7 +1159,8 @@ function DemandPage({ orders, addOrder, updateOrder, deleteOrder, cancelOrder, c
     const goesToPlanning = !hasItems;
     const deliveryChanged = isEditing && editingOrder && deliveryDate !== editingOrder.deliveryDate;
 
-    const doSave = (deliveryReason) => {
+    const doSave = async (deliveryReason) => {
+      setConfirm(null); setReasonModal(null);
       const items = cleanItems(demandItems);
       const base = { client: clientRegistered ? clientNorm : client, orderNumber: orderNumber.trim(), deliveryDate, observations, missingItems };
       const sched = hasItems ? daysToChanges(finalDays) : { productionDays: [], productionStart: "", productionEnd: "" };
@@ -976,13 +1176,23 @@ function DemandPage({ orders, addOrder, updateOrder, deleteOrder, cancelOrder, c
           changes.status = "scheduled"; changes.plannedAt = new Date().toISOString(); changes.plannedBy = currentUser?.username || "";
           evs.unshift({ type: "planejado", details: { items: items.length, totalTime: orderTotalTime({ items }), days: finalDays } });
         }
+        // Itens lançados/alterados: particularidades de almoxarifado que ainda não foram conferidas neste pedido
+        if (askParticularities && items.length) {
+          const draft = { ...editingOrder, ...changes };
+          const pr = await askParticularities(draft, "planejamento");
+          if (!pr) return;   // cancelou a conferência: nada é salvo, o formulário continua aberto
+          Object.assign(changes, partChanges(editingOrder, pr)); const pe = partEvent(pr); if (pe) evs.push(pe);
+        }
         updateOrder(editingOrderId, changes, evs);
       } else {
         const cm = {}; items.forEach(i => cm[i.code] = false);
         const u = currentUser?.username || "";
-        addOrder({ id: String(Date.now()), ...base, ...sched, items, itemsCompleted: cm, status: goesToPlanning ? "planning" : "scheduled", ...(goesToPlanning ? {} : { plannedAt: new Date().toISOString(), plannedBy: u }) });
+        const order = { id: String(Date.now()), ...base, ...sched, items, itemsCompleted: cm, status: goesToPlanning ? "planning" : "scheduled", ...(goesToPlanning ? {} : { plannedAt: new Date().toISOString(), plannedBy: u }) };
+        const pr = askParticularities ? await askParticularities(order, "cadastro") : { items: [] };   // almoxarifado confere ao cadastrar
+        if (!pr) return;
+        addOrder({ ...order, ...partChanges(order, pr) }, partEvent(pr));
       }
-      resetForm(); setConfirm(null); setReasonModal(null);
+      resetForm();
     };
 
     const proceed = (deliveryReason) => setConfirm({
@@ -1022,6 +1232,7 @@ function DemandPage({ orders, addOrder, updateOrder, deleteOrder, cancelOrder, c
   // Pedido apagado/alterado por outro usuário enquanto estava aberto
   useEffect(() => { if (isEditing && !editingOrder) resetForm(); }, [isEditing, editingOrder]);
 
+  const draftParts = partsForOrder(parts, { client: clientRegistered ? clientNorm : (editingOrder?.client || ""), items: cleanItems(demandItems) });
   const titleText = !isEditing ? "Demanda de Produção" : editingOrder?.status === "planning" ? "Planejar Demanda" : "Editar Demanda";
   const saveLabel = !isEditing ? (demandItems.length ? "Confirmar Pedido" : "Enviar para Planejamento") : (editingOrder?.status === "planning" && demandItems.length ? "Salvar e Programar" : "Salvar Alterações");
   const tabBtn = (id, label) => (
@@ -1095,8 +1306,12 @@ function DemandPage({ orders, addOrder, updateOrder, deleteOrder, cancelOrder, c
 
       {isEditing && (
         <div style={{ display: "flex", gap: 4, borderBottom: `1px solid ${C.border}`, marginBottom: 24 }}>
-          {tabBtn("dados", "Dados do Pedido")}{tabBtn("historico", "Histórico")}
+          {tabBtn("dados", "Dados do Pedido")}{tabBtn("particularidades", `Particularidades${draftParts.length ? ` (${draftParts.length})` : ""}`)}{tabBtn("historico", "Histórico")}
         </div>
+      )}
+
+      {isEditing && tab === "particularidades" && editingOrder && (
+        <OrderParticularities order={{ ...editingOrder, client: clientRegistered ? clientNorm : editingOrder.client, items: cleanItems(demandItems) }} parts={parts} onPrint={() => printOrderParts({ ...editingOrder, items: cleanItems(demandItems) })} />
       )}
 
       {isEditing && tab === "historico" && editingOrder && (
@@ -1112,6 +1327,16 @@ function DemandPage({ orders, addOrder, updateOrder, deleteOrder, cancelOrder, c
       )}
 
       {tab === "dados" && !isCancelled && (<>
+      {draftParts.length > 0 && (
+        <div data-demand-parts style={{ padding: "12px 16px", borderRadius: 8, background: C.orangeDim, border: `1px solid ${C.orange}55`, marginBottom: 18 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: showDraftParts ? 10 : 0 }}>
+            <span style={{ fontSize: 13, fontWeight: 800, color: C.orange, fontFamily: FH, letterSpacing: "0.04em" }}>⚑ {draftParts.length} PARTICULARIDADE{draftParts.length > 1 ? "S" : ""} PARA ESTE {draftParts.some(p => p.scope === "item") ? "CLIENTE/ITENS" : "CLIENTE"}</span>
+            <span style={{ fontSize: 12, color: C.textMuted, fontFamily: F }}>{PART_SECTORS.filter(s => draftParts.some(p => p.sector === s.id)).map(s => `${s.icon} ${s.label} ${draftParts.filter(p => p.sector === s.id).length}`).join(" · ")}</span>
+            <button onClick={() => setShowDraftParts(v => !v)} style={{ marginLeft: "auto", background: "none", border: "none", color: C.orange, cursor: "pointer", fontFamily: FH, fontSize: 12, fontWeight: 700 }}>{showDraftParts ? "Ocultar" : "Ver"}</button>
+          </div>
+          {showDraftParts && <OrderParticularities compact order={{ ...(editingOrder || {}), id: editingOrder?.id, client: clientRegistered ? clientNorm : client, items: cleanItems(demandItems) }} parts={parts} />}
+        </div>
+      )}
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginBottom: 20 }}>
         <Field label="Cliente"><div style={{ position: "relative" }}>
           <input value={client} onChange={e => { setClient(e.target.value.toUpperCase()); setShowClientSugg(true); }} onFocus={() => setShowClientSugg(true)} onBlur={() => setTimeout(() => setShowClientSugg(false), 200)} placeholder="Selecione um cliente cadastrado" style={{ ...inputStyle, borderColor: client && !clientRegistered && !clientUnchangedLegacy ? C.yellow : C.border }} />
@@ -1597,7 +1822,7 @@ function CapacityBanner({ compact = false, children }) {
 // ============================================================
 // DROP ZONE — extracted to module level to prevent remount on each drag/state change
 // ============================================================
-function DropZone({ title, zone, items, color, onDragStart, onDrop, onSelect, onEdit, readOnly, renderExtra, selectedId }) {
+function DropZone({ title, zone, items, color, onDragStart, onDrop, onSelect, onEdit, readOnly, renderExtra, selectedId, partCount }) {
   return (
     <div data-zone={zone} onDragOver={e => { if (readOnly) return; e.preventDefault(); e.currentTarget.style.borderColor = color; }} onDragLeave={e => { e.currentTarget.style.borderColor = C.border; }} onDrop={e => { if (readOnly) return; e.preventDefault(); e.currentTarget.style.borderColor = C.border; onDrop(zone); }}
       style={{ flex: 1, background: C.dark, borderRadius: 10, border: `2px dashed ${C.border}`, padding: 14, minHeight: 170, maxHeight: 300, overflow: "auto", transition: "border-color 0.2s" }}>
@@ -1614,7 +1839,7 @@ function DropZone({ title, zone, items, color, onDragStart, onDrop, onSelect, on
             <div style={{ fontWeight: 800, color: C.text, fontSize: 13, fontFamily: F }}>{o.client}</div>
             {renderExtra && renderExtra(o)}
           </div>
-          <div style={{ color: C.textMuted, fontSize: 11, fontFamily: F, marginTop: 2 }}>#{o.orderNumber} · {fmtSec(orderTotalTime(o))}</div>
+          <div style={{ color: C.textMuted, fontSize: 11, fontFamily: F, marginTop: 2, display: "flex", gap: 6, alignItems: "center" }}>#{o.orderNumber} · {fmtSec(orderTotalTime(o))}{partCount && <PartBadge count={partCount(o)} />}</div>
         </div>
       ))}
       {items.length === 0 && <div style={{ color: C.textDim, fontSize: 12, textAlign: "center", fontFamily: F, padding: 16 }}>{readOnly ? "Nenhum pedido" : "Arraste pedidos aqui"}</div>}
@@ -1625,7 +1850,7 @@ function DropZone({ title, zone, items, color, onDragStart, onDrop, onSelect, on
 // ============================================================
 // PAGE 3: DEMANDAS EM ABERTO
 // ============================================================
-function OpenDemandsPage({ orders, updateOrder, setEditingOrderId, setActivePage, logistics, saveLogistics, currentUser, startExecution, pauseExecution, completeOrder, startTimerOnly, shift, isWorkDay }) {
+function OpenDemandsPage({ parts = [], askParticularities, printOrderParts, partChanges, partEvent, orders, updateOrder, setEditingOrderId, setActivePage, logistics, saveLogistics, currentUser, startExecution, pauseExecution, completeOrder, startTimerOnly, shift, isWorkDay }) {
   const today = getToday(); const tomorrow = getTomorrow();
   const readOnly = currentUser?.role === "vendedor";
   const [selectedExec, setSelectedExec] = useState(null);
@@ -1714,15 +1939,17 @@ function OpenDemandsPage({ orders, updateOrder, setEditingOrderId, setActivePage
     updateOrder(orderId, { missingItems: (order.missingItems || []).map(m => m.code === code ? { ...m, delivered: !m.delivered } : m) },
       m && !m.delivered ? { type: "faltante_entregue", details: { code, qty: m.qty } } : { type: "faltante_adicionado", details: { code, qty: m?.qty, note: "Marcado de volta como pendente" } });
   }
-  function deliverOrder(id) {
+  async function deliverOrder(id) {
     const order = orders.find(o => o.id === id);
     const hasMissing = order && order.items.length > 0 && !order.items.every(i => order.itemsCompleted[i.code]);
-    setDeliverModal({ orderId: id, hasMissing, location: "" });
+    const pr = askParticularities ? await askParticularities(order, "conclusao") : { items: [] };   // expedição confere antes de receber
+    if (!pr) return;
+    setDeliverModal({ orderId: id, hasMissing, location: "", partRes: pr });
   }
   function confirmDeliver() {
     if (!deliverModal || !deliverModal.location.trim()) return;
     const { orderId, location } = deliverModal;
-    completeOrder(orderId, location.trim());
+    completeOrder(orderId, location.trim(), deliverModal.partRes);
     const existing = (logistics || {})[String(orderId)] || {};
     if (saveLogistics) saveLogistics({ [String(orderId)]: { ...existing, completionDate: getToday(), location: location.trim() } });
     setSelectedExec(null);
@@ -1741,6 +1968,8 @@ function OpenDemandsPage({ orders, updateOrder, setEditingOrderId, setActivePage
   const notStartedTag = o => notStarted(o) && !isLate(o) ? <span title={`Estava programado para ${fmtDateFull(firstDay(o))} e ainda não foi iniciado`} style={{ ...tagStyle, background: C.orangeDim, color: C.orange, border: `1px solid ${C.orange}66` }}>NÃO INICIADO · {fmtDate(firstDay(o))}</span> : null;
   const tagsFor = o => { const a = lateTag(o), b = notStartedTag(o); return a || b ? <span style={{ display: "flex", flexDirection: "column", gap: 3, alignItems: "flex-end" }}>{a}{b}</span> : null; };
   const pausingOrder = pauseReq ? orders.find(x => x.id === pauseReq.id) : null;
+  const partCount = o => partsForOrder(parts, o).length;
+  const [showExecParts, setShowExecParts] = useState(true);
 
   return (
     <div style={{ padding: 24, height: "100vh", display: "flex", flexDirection: "column", overflow: "hidden", boxSizing: "border-box" }}>
@@ -1774,9 +2003,9 @@ function OpenDemandsPage({ orders, updateOrder, setEditingOrderId, setActivePage
         <span style={{ fontSize: 13, color: C.textMuted, fontFamily: F }}>{getDayName(today)} — {fmtDateFull(today)}</span>
       </div>
       <div style={{ display: "flex", gap: 14, marginBottom: 18 }}>
-        <DropZone title="Em Execução" zone="executing" items={executingOrders} color={C.green} onDragStart={setDragItem} onDrop={handleDrop} onSelect={setSelectedExec} onEdit={editOrder} readOnly={readOnly} renderExtra={o => <span style={{ display: "flex", flexDirection: "column", gap: 3, alignItems: "flex-end" }}>{timerTag(o)}{lateTag(o)}</span>} selectedId={execOrder?.id} />
-        <DropZone title="Programado Hoje" zone="today" items={todayOrders} color={C.red} onDragStart={setDragItem} onDrop={handleDrop} onSelect={setSelectedExec} onEdit={editOrder} readOnly={readOnly} renderExtra={tagsFor} />
-        <DropZone title="Programado Amanhã" zone="tomorrow" items={tomorrowOrders} color={C.steel} onDragStart={setDragItem} onDrop={handleDrop} onSelect={setSelectedExec} onEdit={editOrder} readOnly={readOnly} renderExtra={lateTag} />
+        <DropZone title="Em Execução" zone="executing" items={executingOrders} color={C.green} onDragStart={setDragItem} onDrop={handleDrop} onSelect={setSelectedExec} onEdit={editOrder} readOnly={readOnly} renderExtra={o => <span style={{ display: "flex", flexDirection: "column", gap: 3, alignItems: "flex-end" }}>{timerTag(o)}{lateTag(o)}</span>} selectedId={execOrder?.id} partCount={partCount} />
+        <DropZone title="Programado Hoje" zone="today" items={todayOrders} color={C.red} onDragStart={setDragItem} onDrop={handleDrop} onSelect={setSelectedExec} onEdit={editOrder} readOnly={readOnly} renderExtra={tagsFor} partCount={partCount} />
+        <DropZone title="Programado Amanhã" zone="tomorrow" items={tomorrowOrders} color={C.steel} onDragStart={setDragItem} onDrop={handleDrop} onSelect={setSelectedExec} onEdit={editOrder} readOnly={readOnly} renderExtra={lateTag} partCount={partCount} />
       </div>
       {execOrder && execOrder.status === "executing" && (
         <div style={{ flex: 1, minHeight: 0, background: C.darkCard, borderRadius: 10, border: `1px solid ${C.border}`, overflow: "hidden", display: "flex", flexDirection: "column" }}>
@@ -1797,6 +2026,16 @@ function OpenDemandsPage({ orders, updateOrder, setEditingOrderId, setActivePage
               ) : <span style={{ fontSize: 12, color: C.textMuted, fontFamily: F }}>⏱ Cronômetro rodando desde {fmtDateTime((execOrder.execSessions || [])[execOrder.execSessions.length - 1]?.start)} — conta só o horário de expediente.</span>}
               <span style={{ marginLeft: "auto" }} />
               <Btn variant="custom" onClick={() => setPauseReq({ id: execOrder.id, target: "today" })} style={{ padding: "6px 14px", fontSize: 12, background: C.yellowDim, color: C.yellow, border: `1px solid ${C.yellow}66` }}>⏸ Retirar da produção</Btn>
+            </div>
+          )}
+          {partCount(execOrder) > 0 && (
+            <div data-exec-parts style={{ padding: "10px 24px", borderBottom: `1px solid ${C.border}`, background: C.orangeDim }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                <span style={{ fontSize: 12, fontWeight: 800, color: C.orange, fontFamily: FH, letterSpacing: "0.06em" }}>⚑ PARTICULARIDADES DESTE PEDIDO ({partCount(execOrder)})</span>
+                <button onClick={() => printOrderParts && printOrderParts(execOrder)} style={{ background: "none", border: `1px solid ${C.orange}66`, borderRadius: 5, color: C.orange, cursor: "pointer", fontFamily: FH, fontSize: 11, fontWeight: 700, padding: "3px 10px" }}>🖨 Imprimir</button>
+                <button onClick={() => setShowExecParts(v => !v)} style={{ marginLeft: "auto", background: "none", border: "none", color: C.orange, cursor: "pointer", fontFamily: FH, fontSize: 12, fontWeight: 700 }}>{showExecParts ? "Ocultar" : "Ver"}</button>
+              </div>
+              {showExecParts && <div style={{ marginTop: 8, maxHeight: 220, overflow: "auto" }}><OrderParticularities compact order={execOrder} parts={parts} /></div>}
             </div>
           )}
           <div style={{ display: "grid", gridTemplateColumns: "2fr 3fr 1fr 1.5fr", padding: "8px 24px", borderBottom: `1px solid ${C.border}`, fontSize: 10, fontWeight: 700, color: C.textDim, fontFamily: FH, textTransform: "uppercase", letterSpacing: "0.08em" }}>
@@ -2314,7 +2553,9 @@ function ExportPage({ orders, registeredItems, fetchAllEvents, logistics }) {
 // ============================================================
 // PAGE 7: LOGÍSTICA
 // ============================================================
-function LogisticsPage({ orders, logistics, saveLogistics, updateOrder, logEvent, readOnly = false }) {
+function LogisticsPage({ parts = [], askParticularities, partChanges, partEvent, printOrderParts, orders, logistics, saveLogistics, updateOrder, logEvent, readOnly = false }) {
+  const [partsView, setPartsView] = useState(null);   // pedido cujas particularidades estão abertas
+  const partBadge = o => <PartBadge count={partsForOrder(parts, o).length} onClick={() => setPartsView(o.id)} />;
   const orderById = id => orders.find(o => o.id === id) || { id };
   const today = getToday();
   const completedOrders = orders.filter(o => o.status === "completed");
@@ -2401,10 +2642,15 @@ function LogisticsPage({ orders, logistics, saveLogistics, updateOrder, logEvent
   }
 
   // Expedido: confirmação
-  function requestExpedir(o) {
+  // Expedido = conclusão do pedido: se houver particularidades, o popup de confirmação final substitui o "Sim/Não"
+  async function requestExpedir(o) {
+    const doIt = pr => { updateLogi(o.id, { collected: true, collectedDate: today }); logEvent(o, "expedido", {}); if (pr?.entry) updateOrder(o.id, partChanges(o, pr), partEvent(pr)); setConfirm(null); };
+    const pr = askParticularities ? await askParticularities(o, "expedido") : { items: [] };
+    if (!pr) return;
+    if (pr.entry) { doIt(pr); return; }
     setConfirm({
       message: `Confirmar expedição do pedido #${o.orderNumber} — ${o.client}? O pedido sairá da logística e ficará verde no calendário.`,
-      onYes: () => { updateLogi(o.id, { collected: true, collectedDate: today }); logEvent(o, "expedido", {}); setConfirm(null); },
+      onYes: () => doIt(null),
       onNo: () => setConfirm(null),
     });
   }
@@ -2483,6 +2729,9 @@ function LogisticsPage({ orders, logistics, saveLogistics, updateOrder, logEvent
       </Modal>
 
       {/* ── MODAL EDITAR (Seção 3) ──────────────────────────── */}
+      <Modal open={!!partsView} onClose={() => setPartsView(null)} title={partsView ? `Particularidades — #${orderById(partsView).orderNumber} ${orderById(partsView).client || ""}` : ""} width={680}>
+        {partsView && <OrderParticularities order={orderById(partsView)} parts={parts} onPrint={() => printOrderParts && printOrderParts(orderById(partsView))} />}
+      </Modal>
       <Modal open={!!editarModal} onClose={() => setEditarModal(null)} title="Editar Informações" width={460}>
         {editarModal && (
           <div>
@@ -2538,7 +2787,7 @@ function LogisticsPage({ orders, logistics, saveLogistics, updateOrder, logEvent
                 <div key={o.id} style={{ borderBottom: idx < withMissing.length - 1 ? `1px solid ${C.border}` : "none" }}>
                   {/* cabeçalho do pedido */}
                   <div style={{ display: "grid", gridTemplateColumns: "90px 1.5fr 130px 130px 130px 32px", padding: "14px 20px", alignItems: "center", background: "rgba(239,68,68,0.05)", gap: 8 }}>
-                    <span style={{ fontWeight: 800, color: C.red, fontFamily: FH, fontSize: 14 }}>#{o.orderNumber}</span>
+                    <span style={{ fontWeight: 800, color: C.red, fontFamily: FH, fontSize: 14, display: "flex", gap: 6, alignItems: "center" }}>#{o.orderNumber}{partBadge(o)}</span>
                     <span style={{ fontWeight: 700, color: C.text, fontFamily: F, fontSize: 13 }}>{o.client}</span>
                     <div>
                       <div style={{ fontSize: 10, color: C.textDim, fontFamily: FH, textTransform: "uppercase", fontWeight: 700, marginBottom: 2 }}>Conclusão</div>
@@ -2595,7 +2844,7 @@ function LogisticsPage({ orders, logistics, saveLogistics, updateOrder, logEvent
               const lg = getLogi(o.id);
               return (
                 <div key={o.id} style={{ ...ROW, gridTemplateColumns: COLS2 }}>
-                  <span style={{ fontWeight: 800, color: C.red }}>#{o.orderNumber}</span>
+                  <span style={{ fontWeight: 800, color: C.red, display: "flex", gap: 6, alignItems: "center" }}>#{o.orderNumber}{partBadge(o)}</span>
                   <span style={{ fontWeight: 700 }}>{o.client}</span>
                   <span style={{ color: C.textMuted, fontSize: 12 }}>{lg.completionDate ? fmtDateFull(lg.completionDate) : "—"}</span>
                   <span style={{ color: C.textMuted, fontSize: 12 }}>{fmtDateFull(o.deliveryDate)}</span>
@@ -2628,7 +2877,7 @@ function LogisticsPage({ orders, logistics, saveLogistics, updateOrder, logEvent
             const lg = getLogi(o.id);
             return (
               <div key={o.id} style={{ ...ROW, gridTemplateColumns: COLS3 }}>
-                <span style={{ fontWeight: 800, color: C.red }}>#{o.orderNumber}</span>
+                <span style={{ fontWeight: 800, color: C.red, display: "flex", gap: 6, alignItems: "center" }}>#{o.orderNumber}{partBadge(o)}</span>
                 <span style={{ fontWeight: 700 }}>{o.client}</span>
                 <span style={{ color: lg.carrier ? C.text : C.textDim, fontSize: 12 }}>{lg.carrier || "—"}</span>
                 <span style={{ color: lg.location ? C.text : C.textDim, fontSize: 12 }}>{lg.location || "—"}</span>
@@ -2961,6 +3210,159 @@ function MissingItemsPage({ orders, updateOrder, setEditingOrderId, setActivePag
 }
 
 // ============================================================
+// PARTICULARIDADES — cadastro (todos os usuários cadastram, editam e excluem; exclusão pode ser desfeita)
+// ============================================================
+function ParticularitiesPage({ parts, partsReady, clientHistory, registeredItems, orders, currentUser, addPart, updatePart, setPartActive }) {
+  const [search, setSearch] = useState("");
+  const [sector, setSector] = useState("");
+  const [scope, setScope] = useState("");
+  const [showInactive, setShowInactive] = useState(false);
+  const [form, setForm] = useState(null);   // { id?, scope, client, itemCode, sector, description }
+  const [confirm, setConfirm] = useState(null);
+  const [sugg, setSugg] = useState(false);
+  const [saving, setSaving] = useState(false);
+
+  const q = search.trim().toUpperCase();
+  const filtered = (parts || []).filter(p => (showInactive ? !p.active : p.active)
+    && (!sector || p.sector === sector) && (!scope || p.scope === scope)
+    && (!q || (p.client || "").includes(q) || (p.itemCode || "").includes(q) || p.description.toUpperCase().includes(q)));
+  const groups = {};
+  filtered.forEach(p => { const k = p.scope === "cliente" ? "C|" + p.client : "I|" + p.itemCode; (groups[k] = groups[k] || []).push(p); });
+  const keys = Object.keys(groups).sort((a, b) => a[0] === b[0] ? a.localeCompare(b) : a[0] === "C" ? -1 : 1);
+  const itemDesc = code => registeredItems.find(i => i.code === code)?.description || "";
+
+  const fClient = form ? normName(form.client) : "";
+  const fItem = form ? String(form.itemCode || "").trim().toUpperCase() : "";
+  const clientOk = form?.scope !== "cliente" || clientHistory.includes(fClient);
+  const itemKnown = !!registeredItems.find(i => i.code === fItem);
+  const formOk = form && form.sector && form.description.trim().length >= 3 && (form.scope === "cliente" ? clientOk && fClient : !!fItem);
+  const suggestions = !form ? [] : form.scope === "cliente"
+    ? clientHistory.filter(c => c.includes(fClient)).slice(0, 8)
+    : registeredItems.filter(i => i.code.includes(fItem) || i.description.toUpperCase().includes(fItem)).slice(0, 8).map(i => i.code);
+  const openOrdersFor = p => (orders || []).filter(o => !["completed", "cancelled"].includes(o.status) && partsForOrder([p], o).length).length;
+
+  async function save() {
+    if (!formOk || saving) return;
+    setSaving(true);
+    const data = { scope: form.scope, client: form.scope === "cliente" ? fClient : null, itemCode: form.scope === "item" ? fItem : null, sector: form.sector, description: form.description.trim() };
+    const ok = form.id ? await updatePart(form.id, data) : await addPart(data);
+    setSaving(false);
+    if (ok) setForm(null);
+  }
+  const chip = (on, color) => ({ padding: "6px 12px", borderRadius: 16, border: `1px solid ${on ? color : C.border}`, background: on ? color + "22" : C.darkInput, color: on ? color : C.textMuted, cursor: "pointer", fontFamily: FH, fontSize: 12, fontWeight: 700 });
+
+  return (
+    <div style={{ padding: 32, maxWidth: 1100, margin: "0 auto" }}>
+      <ConfirmDialog open={!!confirm} message={confirm?.message || ""} onYes={confirm?.onYes} onNo={() => setConfirm(null)} />
+      <Modal open={!!form} onClose={() => setForm(null)} title={form?.id ? "Editar particularidade" : "Nova particularidade"} width={560}>
+        {form && (
+          <div data-part-form>
+            <Field label="Vale para">
+              <div style={{ display: "flex", gap: 8 }}>
+                <button data-scope-btn="cliente" onClick={() => setForm({ ...form, scope: "cliente" })} style={chip(form.scope === "cliente", C.red)}>🏢 Um cliente (todos os pedidos dele)</button>
+                <button data-scope-btn="item" onClick={() => setForm({ ...form, scope: "item" })} style={chip(form.scope === "item", C.red)}>📦 Um item (em qualquer cliente)</button>
+              </div>
+            </Field>
+            {form.scope === "cliente" ? (
+              <Field label="Cliente">
+                <div style={{ position: "relative" }}>
+                  <input data-part-client value={form.client} onChange={e => { setForm({ ...form, client: e.target.value.toUpperCase() }); setSugg(true); }} onFocus={() => setSugg(true)} onBlur={() => setTimeout(() => setSugg(false), 200)} placeholder="Selecione um cliente cadastrado" style={{ ...inputStyle, borderColor: form.client && !clientOk ? C.yellow : C.border }} />
+                  {sugg && <SuggestionDropdown items={suggestions} onSelect={c => { setForm(f => ({ ...f, client: c })); setSugg(false); }} renderLabel={c => c} />}
+                </div>
+                {form.client && !clientOk && <div style={{ fontSize: 12, color: C.yellow, fontFamily: F, marginTop: 6 }}>Cliente não cadastrado — selecione da lista (cadastre novos clientes em Demanda de Produção ou Clientes).</div>}
+              </Field>
+            ) : (
+              <Field label="Código do item">
+                <div style={{ position: "relative" }}>
+                  <input data-part-item value={form.itemCode} onChange={e => { setForm({ ...form, itemCode: e.target.value.toUpperCase() }); setSugg(true); }} onFocus={() => setSugg(true)} onBlur={() => setTimeout(() => setSugg(false), 200)} placeholder="Código do item (catálogo)" style={inputStyle} />
+                  {sugg && <SuggestionDropdown items={suggestions} onSelect={c => { setForm(f => ({ ...f, itemCode: c })); setSugg(false); }} renderLabel={c => `${c} — ${itemDesc(c)}`} />}
+                </div>
+                {fItem && <div style={{ fontSize: 12, color: itemKnown ? C.textMuted : C.yellow, fontFamily: F, marginTop: 6 }}>{itemKnown ? itemDesc(fItem) : "Código fora do catálogo — confira se está escrito igual ao usado nos pedidos."}</div>}
+              </Field>
+            )}
+            <Field label="Setor">
+              <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                {PART_SECTORS.map(s => <button key={s.id} data-sector-btn={s.id} onClick={() => setForm({ ...form, sector: s.id })} style={chip(form.sector === s.id, s.color)}>{s.icon} {s.label}</button>)}
+              </div>
+            </Field>
+            <Field label="Particularidade">
+              <textarea data-part-desc value={form.description} onChange={e => setForm({ ...form, description: e.target.value })} rows={4} placeholder="Ex.: Embalar cada mangueira individualmente com plástico bolha e etiqueta com o nº do pedido do cliente." style={{ ...inputStyle, resize: "vertical", fontFamily: F }} />
+            </Field>
+            <div style={{ fontSize: 12, color: C.textMuted, fontFamily: F, marginBottom: 14 }}>
+              Aparece num popup de conferência obrigatória: <strong>almoxarifado</strong> no cadastro do pedido (ou quando os itens são lançados), <strong>montagem</strong> ao iniciar a produção, <strong>expedição</strong> ao concluir a produção, e <strong>todas</strong> ao marcar Expedido.
+            </div>
+            <div style={{ display: "flex", gap: 12, justifyContent: "flex-end" }}>
+              <Btn variant="ghost" onClick={() => setForm(null)}>Cancelar</Btn>
+              <Btn onClick={save} disabled={!formOk || saving}>{saving ? "Salvando..." : form.id ? "Salvar alterações" : "Cadastrar"}</Btn>
+            </div>
+          </div>
+        )}
+      </Modal>
+
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 18, gap: 12, flexWrap: "wrap" }}>
+        <div>
+          <h1 style={{ margin: 0, fontSize: 26, fontWeight: 800, color: C.text, fontFamily: FH, letterSpacing: "0.02em" }}>Particularidades de Clientes</h1>
+          <div style={{ fontSize: 13, color: C.textMuted, fontFamily: F, marginTop: 4 }}>Regras de almoxarifado, montagem e expedição por cliente ou por item — conferidas em cada etapa do pedido.</div>
+        </div>
+        <Btn onClick={() => setForm({ scope: "cliente", client: "", itemCode: "", sector: "", description: "" })} disabled={!partsReady}>+ Nova particularidade</Btn>
+      </div>
+
+      {partsReady === false && (
+        <div style={{ padding: "14px 18px", borderRadius: 8, background: C.yellowDim, border: `1px solid ${C.yellow}40`, color: C.yellow, fontFamily: F, fontSize: 13, marginBottom: 18 }}>
+          ⚠ A tabela de particularidades ainda não existe no banco. Execute o script <strong>supabase_v1.6.0.sql</strong> no SQL Editor do Supabase.
+        </div>
+      )}
+
+      <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap", marginBottom: 18 }}>
+        <input value={search} onChange={e => setSearch(e.target.value)} placeholder="Buscar cliente, item ou texto..." style={{ ...inputStyle, width: 280 }} />
+        <button onClick={() => setSector("")} style={chip(!sector, C.red)}>Todos os setores</button>
+        {PART_SECTORS.map(s => <button key={s.id} onClick={() => setSector(sector === s.id ? "" : s.id)} style={chip(sector === s.id, s.color)}>{s.icon} {s.label}</button>)}
+        <select value={scope} onChange={e => setScope(e.target.value)} style={{ ...inputStyle, width: 170 }}>
+          <option value="">Cliente e item</option><option value="cliente">Só por cliente</option><option value="item">Só por item</option>
+        </select>
+        <label style={{ display: "flex", alignItems: "center", gap: 6, color: C.textMuted, fontSize: 12, fontFamily: F, cursor: "pointer" }}>
+          <input type="checkbox" checked={showInactive} onChange={e => setShowInactive(e.target.checked)} /> Ver excluídas
+        </label>
+      </div>
+
+      {keys.length === 0 && <div style={{ padding: 40, textAlign: "center", color: C.textDim, fontFamily: F, background: C.darkCard, borderRadius: 10, border: `1px solid ${C.border}` }}>{showInactive ? "Nenhuma particularidade excluída." : (parts || []).some(p => p.active) ? "Nenhuma particularidade com esses filtros." : "Nenhuma particularidade cadastrada ainda."}</div>}
+
+      {keys.map(k => {
+        const isClient = k[0] === "C"; const name = k.slice(2); const ps = sortParts(groups[k]);
+        return (
+          <div key={k} data-part-group={name} style={{ background: C.darkCard, borderRadius: 10, border: `1px solid ${C.border}`, marginBottom: 14, overflow: "hidden" }}>
+            <div style={{ padding: "12px 18px", borderBottom: `1px solid ${C.border}`, display: "flex", alignItems: "center", gap: 10 }}>
+              <span style={{ fontSize: 16 }}>{isClient ? "🏢" : "📦"}</span>
+              <span style={{ fontSize: 16, fontWeight: 800, color: C.text, fontFamily: FH }}>{name}</span>
+              <span style={{ fontSize: 12, color: C.textMuted, fontFamily: F }}>{isClient ? "cliente" : `item em qualquer cliente${itemDesc(name) ? " · " + itemDesc(name) : ""}`} · {ps.length}</span>
+              {isClient && !showInactive && <Btn variant="ghost" onClick={() => printParticularities({ client: name, parts: (parts || []).filter(p => p.active && p.scope === "cliente" && p.client === name), user: currentUser?.name })} style={{ marginLeft: "auto", padding: "5px 12px", fontSize: 12 }}>🖨 Imprimir</Btn>}
+            </div>
+            {ps.map(p => { const s = SECTOR_BY_ID[p.sector] || PART_SECTORS[3]; const open = openOrdersFor(p); return (
+              <div key={p.id} data-part-item-row={p.id} style={{ display: "flex", gap: 12, alignItems: "flex-start", padding: "10px 18px", borderBottom: `1px solid ${C.border}` }}>
+                <span style={{ ...partBadgeStyle, background: s.color + "22", color: s.color, border: `1px solid ${s.color}66`, minWidth: 110, textAlign: "center" }}>{s.icon} {s.label}</span>
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontSize: 14, color: C.text, fontFamily: F, fontWeight: 600, whiteSpace: "pre-line" }}>{p.description}</div>
+                  <div style={{ fontSize: 11, color: C.textDim, fontFamily: F, marginTop: 3 }}>
+                    Cadastrada por {p.createdBy || "—"} em {fmtDateTime(p.createdAt)}{p.updatedBy && p.updatedAt && p.updatedAt !== p.createdAt ? ` · alterada por ${p.updatedBy} em ${fmtDateTime(p.updatedAt)}` : ""}
+                    {open > 0 && !showInactive && <span style={{ color: C.orange }}> · vale para {open} pedido{open > 1 ? "s" : ""} em aberto</span>}
+                  </div>
+                </div>
+                {showInactive
+                  ? <Btn variant="ghost" onClick={() => setPartActive(p.id, true)} style={{ padding: "5px 12px", fontSize: 12 }}>↺ Restaurar</Btn>
+                  : <>
+                      <Btn variant="ghost" onClick={() => setForm({ id: p.id, scope: p.scope, client: p.client || "", itemCode: p.itemCode || "", sector: p.sector, description: p.description })} style={{ padding: "5px 12px", fontSize: 12 }}>✎ Editar</Btn>
+                      <Btn variant="ghost" onClick={() => setConfirm({ message: `Excluir esta particularidade de ${isClient ? "cliente " : "item "}${name}?\n\n"${p.description}"\n\nEla deixa de aparecer nos pedidos. Dá para restaurar em "Ver excluídas".`, onYes: () => { setConfirm(null); setPartActive(p.id, false); } })} style={{ padding: "5px 12px", fontSize: 12, color: C.danger }}>🗑</Btn>
+                    </>}
+              </div>
+            ); })}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ============================================================
 // PAGE 8: USUÁRIOS (gestor only)
 // ============================================================
 function UsersPage({ users, addUser, updateUser, deleteUser, currentUser }) {
@@ -3115,6 +3517,7 @@ const LSK = {
   users:    'pcp_bvn_users',
   sync:     'pcp_bvn_lastsync',
   events:   'pcp_bvn_pending_events', // eventos de histórico ainda não enviados (offline/tabela ausente)
+  parts:    'pcp_bvn_particularities',
 };
 
 // ============================================================
@@ -3139,6 +3542,12 @@ export default function App() {
   const [syncing, setSyncing] = useState(false);
   const [eventsVersion, setEventsVersion] = useState(0);
   const [eventsTableMissing, setEventsTableMissing] = useState(false);
+  const [parts, setParts] = useState([]);              // particularidades (cliente/item)
+  const [partsReady, setPartsReady] = useState(null);  // null = carregando; false = tabela ainda não criada (script v1.6.0)
+  const [partGate, setPartGate] = useState(null);      // popup de conferência aberto: { order, stage, list, resolve }
+  const partsRef = useRef(parts); partsRef.current = parts;
+  const partsReadyRef = useRef(null); partsReadyRef.current = partsReady;
+  const partColMissingRef = useRef(false);            // orders.particularity_checks ainda não existe
   const currentUserRef = useRef(null);
   useEffect(() => { currentUserRef.current = currentUser; }, [currentUser]);
 
@@ -3231,6 +3640,7 @@ export default function App() {
       cancelReason: o.cancel_reason || '', cancelledAt: o.cancelled_at || null, cancelledBy: o.cancelled_by || '',
       originalDeliveryDate: o.original_delivery_date || null,
       updatedAt: o.updated_at || null,   // carimbo usado pela atualização automática para achar o que mudou
+      particularityChecks: o.particularity_checks || [],
     };
   }
   // Campos JS → colunas do Supabase
@@ -3240,6 +3650,7 @@ export default function App() {
     createdBy: 'created_by', plannedAt: 'planned_at', plannedBy: 'planned_by', executedAt: 'executed_at', executedBy: 'executed_by',
     completedAt: 'completed_at', completedBy: 'completed_by', execSessions: 'exec_sessions', execSeconds: 'exec_seconds', execWallSeconds: 'exec_wall_seconds',
     cancelReason: 'cancel_reason', cancelledAt: 'cancelled_at', cancelledBy: 'cancelled_by', originalDeliveryDate: 'original_delivery_date',
+    particularityChecks: 'particularity_checks',
   };
   // Colunas criadas pelo script SQL da v1.5.0 — se ainda não existirem, o app grava sem elas em vez de falhar
   const NEW_COLS = ['planned_at', 'planned_by', 'exec_sessions', 'exec_seconds', 'exec_wall_seconds', 'cancel_reason', 'cancelled_at', 'cancelled_by', 'original_delivery_date'];
@@ -3253,6 +3664,7 @@ export default function App() {
       db.complementary_complete = changes.missingItems.length === 0 || changes.missingItems.every(i => i.delivered);
     }
     if (missingColsRef.current) NEW_COLS.forEach(c => delete db[c]);
+    if (partColMissingRef.current) delete db.particularity_checks;
     if (Object.keys(db).length) db.updated_at = new Date().toISOString();   // o banco não atualiza sozinho (sem trigger)
     return db;
   }
@@ -3295,8 +3707,28 @@ export default function App() {
   function mapUser(u) {
     return { username: u.username, password: u.password, name: u.name || u.username, role: u.role };
   }
+  function mapPart(p) {
+    return { id: p.id, scope: p.scope, client: p.client || null, itemCode: p.item_code || null, sector: p.sector, description: p.description || '', active: p.active !== false, createdBy: p.created_by || '', createdAt: p.created_at || null, updatedBy: p.updated_by || '', updatedAt: p.updated_at || null };
+  }
   function mapItem(i) {
     return { code: i.code, description: i.description, productionTime: i.production_time };
+  }
+
+  // Particularidades + coluna de conferências nos pedidos (script v1.6.0). Sem o script: a tela avisa e os popups não aparecem.
+  const partStampRef = useRef(0);
+  async function loadParticularities() {
+    const [pr, cp] = await Promise.all([
+      supabase.from('particularities').select('*'),
+      supabase.from('orders').select('particularity_checks').limit(1),
+    ]);
+    partColMissingRef.current = !!cp.error;
+    if (pr.error) { setPartsReady(false); return false; }
+    const list = pr.data.map(mapPart);
+    setParts(prev => JSON.stringify(prev) === JSON.stringify(list) ? prev : list);
+    LS.set(LSK.parts, list);
+    partStampRef.current = Math.max(0, ...pr.data.map(r => Date.parse(r.updated_at) || 0));
+    setPartsReady(true);
+    return true;
   }
 
   async function loadData() {
@@ -3325,6 +3757,7 @@ export default function App() {
       setDayOverrides(cached.overrides);
       setLogistics(cached.logistics);
       if (cached.users && cached.users.length > 0) setUsers(cached.users);
+      setParts(LS.get(LSK.parts, []));
       syncedRef.current = true;
       setLoading(false); // app visível imediatamente
     }
@@ -3387,6 +3820,7 @@ export default function App() {
       missingColsRef.current = !!colProbe.error;
       setEventsTableMissing(!!evProbe.error || !!colProbe.error);
       if (!evProbe.error) flushPendingEvents();
+      await loadParticularities();
     } catch (e) {
       console.error("Supabase indisponível:", e);
       if (hasCache) {
@@ -3584,6 +4018,16 @@ export default function App() {
         }
         itRes.data.forEach(r => { itemStampRef.current = Math.max(itemStampRef.current, stampMs(r.updated_at)); });
       }
+      // particularidades: carga completa junto com a dos pedidos; nos outros ciclos só o que mudou (a tabela tem carimbo do banco)
+      if (full) await loadParticularities();
+      else if (partsReadyRef.current) {
+        const pr = await supabase.from('particularities').select('*').gt('updated_at', since(partStampRef.current));
+        if (!pr.error && pr.data.length) {
+          const ch = new Map(pr.data.map(r => [r.id, mapPart(r)]));
+          setParts(prev => { const next = prev.map(p => ch.get(p.id) || p); const have = new Set(next.map(p => p.id)); ch.forEach((p, id) => { if (!have.has(id)) next.push(p); }); if (JSON.stringify(next) === JSON.stringify(prev)) return prev; LS.set(LSK.parts, next); return next; });
+          pr.data.forEach(r => { partStampRef.current = Math.max(partStampRef.current, stampMs(r.updated_at)); });
+        }
+      }
       if (full) lastFullRef.current = Date.now();
       window.__pcpSync = { ...(window.__pcpSync || {}), ok: new Date().toISOString(), mode: stamps ? 'carimbo' : 'compatível', full, ms: Date.now() - t0, lastFull: new Date(lastFullRef.current).toISOString() };   // diagnóstico (console: __pcpSync)
       LS.set(LSK.sync, new Date().toISOString());
@@ -3638,7 +4082,7 @@ export default function App() {
     return () => { clearInterval(t); document.removeEventListener('visibilitychange', run); window.removeEventListener('focus', run); window.removeEventListener('online', run); };
   }, []);
 
-  async function addOrder(order) {
+  async function addOrder(order, extraEvents) {
     // Validar dados antes de inserir
     if (!order.id || !order.client || !order.orderNumber) {
       showToast('Pedido incompleto. Verifique os dados.');
@@ -3650,10 +4094,12 @@ export default function App() {
     setOrders(prev => [...prev, full]);
     const row = { id: String(order.id), ...toDb({ ...full, createdAt: undefined }), missing_items: order.missingItems || [], has_complementary: (order.missingItems || []).length > 0, complementary_complete: (order.missingItems || []).length === 0 };
     let { error } = await supabase.from('orders').insert(row);
+    if (error && /particularity_checks/.test(error.message || '')) { partColMissingRef.current = true; delete row.particularity_checks; ({ error } = await supabase.from('orders').insert(row)); }
     if (error && isMissingColErr(error)) { missingColsRef.current = true; setEventsTableMissing(true); NEW_COLS.forEach(c => delete row[c]); ({ error } = await supabase.from('orders').insert(row)); }
     if (error) { handleSaveError(error, () => setOrders(prev => prev.filter(o => o.id !== order.id)), "Erro ao salvar pedido. Tente novamente."); return; }
     logEvent(full, 'criado', { status: full.status, items: (full.items || []).length, totalTime: orderTotalTime(full), days: full.productionDays || [], deliveryDate: full.deliveryDate });
     if (full.status === 'scheduled') logEvent(full, 'planejado', { items: full.items.length, totalTime: orderTotalTime(full), days: full.productionDays, note: 'Cadastrado já com itens e dias' });
+    [].concat(extraEvents || []).forEach(ev => ev && logEvent(full, ev.type, ev.details || {}));
   }
   // events: evento (ou lista) { type, details } gravado no histórico se o update funcionar
   async function updateOrder(id, changes, events) {
@@ -3661,6 +4107,7 @@ export default function App() {
     setOrders(p => p.map(o => o.id === id ? { ...o, ...changes } : o));
     const db = toDb(changes);
     let { error } = Object.keys(db).length ? await supabase.from('orders').update(db).eq('id', String(id)) : { error: null };
+    if (error && /particularity_checks/.test(error.message || '')) { partColMissingRef.current = true; const db2 = toDb(changes); ({ error } = Object.keys(db2).length ? await supabase.from('orders').update(db2).eq('id', String(id)) : { error: null }); }
     if (error && isMissingColErr(error)) { missingColsRef.current = true; setEventsTableMissing(true); const db2 = toDb(changes); ({ error } = Object.keys(db2).length ? await supabase.from('orders').update(db2).eq('id', String(id)) : { error: null }); }
     if (error) { handleSaveError(error, () => { if (prev) setOrders(p => p.map(o => o.id === id ? prev : o)); }, "Erro ao atualizar pedido. Alteração desfeita."); if (!(offlineModeRef.current || error?.status === 0)) return; }
     const ref = { ...(prev || { id }), ...changes };
@@ -3668,14 +4115,17 @@ export default function App() {
   }
 
   // ── Execução: cronômetro por sessões ─────────────────────────
-  function startExecution(id) {
-    const o = orders.find(x => x.id === id); if (!o || o.status === 'executing') return;
+  async function startExecution(id) {
+    let o = orders.find(x => x.id === id); if (!o || o.status === 'executing') return;
+    const pr = await askParticularities(o, 'execucao');   // montagem confere as particularidades antes de iniciar
+    if (!pr) return;
+    o = ordersRef.current.find(x => x.id === id) || o; if (o.status === 'executing') return;
     const u = currentUserRef.current; const now = new Date().toISOString();
     const sessions = [...(o.execSessions || []), { start: now, by: u?.username || '' }];
     const parallel = orders.filter(x => x.status === 'executing' && x.id !== id).map(x => `#${x.orderNumber}`);
     const first = !(o.execSessions || []).length && !o.executedAt;
-    updateOrder(id, { status: 'executing', execSessions: sessions, ...(first ? { executedAt: now, executedBy: u?.username || '' } : {}) },
-      { type: first ? 'execucao_iniciada' : 'execucao_retomada', details: { parallel } });
+    updateOrder(id, { status: 'executing', execSessions: sessions, ...(first ? { executedAt: now, executedBy: u?.username || '' } : {}), ...partChanges(o, pr) },
+      [partEvent(pr), { type: first ? 'execucao_iniciada' : 'execucao_retomada', details: { parallel } }]);
   }
   function startTimerOnly(id) {
     const o = orders.find(x => x.id === id); if (!o || o.status !== 'executing') return;
@@ -3698,16 +4148,72 @@ export default function App() {
     updateOrder(id, { status: 'scheduled', execSessions: sessions, ...scheduleChanges },
       { type: 'execucao_pausada', details: { reason, ...(sessions.length ? { execBusiness: t.business, execWall: t.wall } : { note: 'Sem cronômetro (execução iniciada antes da v1.5.0)' }), estimated: orderTotalTime(o), ...(scheduleChanges.productionDays ? { daysBefore: effectiveDays(o), daysAfter: scheduleChanges.productionDays } : {}) } });
   }
-  function completeOrder(id, location) {
+  function completeOrder(id, location, partRes) {
     const o = orders.find(x => x.id === id); if (!o) return;
     const u = currentUserRef.current;
     const { sessions, now } = closeSession(o, 'complete');
     const t = execTotals({ ...o, execSessions: sessions }, shift, isWorkDay);
     const pendingItems = o.items.filter(i => !o.itemsCompleted[i.code]).map(i => i.code);
     const measured = sessions.length > 0; // pedido iniciado antes da v1.5.0 sem cronômetro → tempo "não medido", não zero
-    updateOrder(id, { status: 'completed', execSessions: sessions, completedAt: now, completedBy: u?.username || '', execSeconds: measured ? t.business : null, execWallSeconds: measured ? t.wall : null },
-      { type: 'concluido', details: { location, ...(measured ? { execBusiness: t.business, execWall: t.wall } : { note: 'Sem cronômetro (execução iniciada antes da v1.5.0)' }), estimated: orderTotalTime(o), pauses: t.pauses, pendingItems, missing: (o.missingItems || []).filter(m => !m.delivered).map(m => `${m.code}×${m.qty}`) } });
+    updateOrder(id, { status: 'completed', execSessions: sessions, completedAt: now, completedBy: u?.username || '', execSeconds: measured ? t.business : null, execWallSeconds: measured ? t.wall : null, ...partChanges(o, partRes) },
+      [partEvent(partRes), { type: 'concluido', details: { location, ...(measured ? { execBusiness: t.business, execWall: t.wall } : { note: 'Sem cronômetro (execução iniciada antes da v1.5.0)' }), estimated: orderTotalTime(o), pauses: t.pauses, pendingItems, missing: (o.missingItems || []).filter(m => !m.delivered).map(m => `${m.code}×${m.qty}`) } }]);
   }
+  // ── Particularidades: popup obrigatório de conferência ───────────────────────
+  // Resolve com null se o usuário cancelar (a ação NÃO acontece); { items: [] } se não há nada a conferir;
+  // { items, entry } com a conferência a gravar no pedido (particularity_checks) e no histórico.
+  function askParticularities(order, stage) {
+    if (!partsReadyRef.current || !order) return Promise.resolve({ items: [] });
+    const list = partsPendingFor(partsRef.current, order, stage);
+    if (!list.length) return Promise.resolve({ items: [] });
+    return new Promise(resolve => setPartGate({ order, stage, list, resolve }));
+  }
+  function closeGate(items) {
+    const g = partGate; setPartGate(null);
+    if (!g) return;
+    g.resolve(items ? { items, entry: { stage: g.stage, at: new Date().toISOString(), by: currentUserRef.current?.username || '', items } } : null);
+  }
+  function partChanges(order, res) {
+    if (!res?.entry) return {};
+    return { particularityChecks: [...(order?.particularityChecks || []), res.entry] };
+  }
+  function partEvent(res) {
+    if (!res?.entry) return null;
+    const notMet = res.items.filter(i => i.status !== 'ok').map(i => ({ text: i.text, reason: i.reason }));
+    return { type: 'particularidades', details: { stage: res.entry.stage, ok: res.items.length - notMet.length, notMet } };
+  }
+  function printOrderParts(order) {
+    printParticularities({ order, parts: partsForOrder(partsRef.current, order), user: currentUserRef.current?.name || currentUserRef.current?.username });
+  }
+
+  async function addPart(data) {
+    const u = currentUserRef.current?.username || '';
+    const row = { scope: data.scope, client: data.client, item_code: data.itemCode, sector: data.sector, description: data.description, created_by: u, updated_by: u };
+    const { data: saved, error } = await supabase.from('particularities').insert(row).select().single();
+    if (error) { showToast('Erro ao cadastrar particularidade: ' + (error.message || 'tente novamente')); return false; }
+    const p = mapPart(saved);
+    setParts(prev => { const n = [...prev.filter(x => x.id !== p.id), p]; LS.set(LSK.parts, n); return n; });
+    showToast('Particularidade cadastrada.', 'success');
+    return true;
+  }
+  async function updatePart(id, data) {
+    const u = currentUserRef.current?.username || '';
+    const db = { updated_by: u };
+    if (data.scope !== undefined) db.scope = data.scope;
+    if (data.client !== undefined) db.client = data.client;
+    if (data.itemCode !== undefined) db.item_code = data.itemCode;
+    if (data.sector !== undefined) db.sector = data.sector;
+    if (data.description !== undefined) db.description = data.description;
+    if (data.active !== undefined) db.active = data.active;
+    const { data: saved, error } = await supabase.from('particularities').update(db).eq('id', id).select().single();
+    if (error) { showToast('Erro ao salvar particularidade: ' + (error.message || 'tente novamente')); return false; }
+    const p = mapPart(saved);
+    setParts(prev => { const n = prev.map(x => x.id === id ? p : x); LS.set(LSK.parts, n); return n; });
+    return true;
+  }
+  async function setPartActive(id, active) {
+    if (await updatePart(id, { active })) showToast(active ? 'Particularidade restaurada.' : 'Particularidade excluída (pode ser restaurada em "Ver excluídas").', 'success');
+  }
+
   function cancelOrder(id, reason) {
     const o = orders.find(x => x.id === id); if (!o) return;
     const u = currentUserRef.current;
@@ -3789,6 +4295,11 @@ export default function App() {
     await supabase.from('client_history').insert({ name: to }).then(() => {});
     await supabase.from('client_history').delete().eq('name', from);
     affected.forEach(o => logEvent({ ...o, client: to }, 'cliente_unificado', { fromClient: from, toClient: to }));
+    if (partsReadyRef.current && partsRef.current.some(p => p.client === from)) {   // particularidades acompanham o cliente
+      const rp = await supabase.from('particularities').update({ client: to, updated_by: currentUserRef.current?.username || '' }).eq('client', from).select();
+      if (rp.error) showToast('Atenção: as particularidades de "' + from + '" não foram transferidas — edite-as na tela Particularidades.');
+      else setParts(prev => { const ch = new Map(rp.data.map(r => [r.id, mapPart(r)])); const n = prev.map(p => ch.get(p.id) || p); LS.set(LSK.parts, n); return n; });
+    }
     showToast(`"${from}" → "${to}" (${affected.length} pedido${affected.length === 1 ? "" : "s"}).`, "success");
   }
   async function deleteClient(name) {
@@ -3931,7 +4442,8 @@ export default function App() {
           <button onClick={updateApp} style={{ background: "#fff", color: C.red, border: "none", borderRadius: 7, padding: "7px 14px", fontWeight: 900, fontFamily: FH, fontSize: 13, cursor: "pointer" }}>ATUALIZAR AGORA</button>
         </div>
       )}
-      {isVendedor && <OrderViewModal order={viewOrder} logistics={logistics} onClose={() => setViewOrderId(null)} />}
+      {isVendedor && <OrderViewModal order={viewOrder} logistics={logistics} parts={parts} printOrderParts={printOrderParts} onClose={() => setViewOrderId(null)} />}
+      <ParticularityGate gate={partGate} onConfirm={items => closeGate(items)} onCancel={() => closeGate(null)} onPrint={() => partGate && printOrderParts(partGate.order)} />
       {syncing && !offlineMode && (
         <div style={{ position: "fixed", top: 0, left: 0, right: 0, zIndex: 2000, background: C.darkCard, color: C.textMuted, padding: "5px 20px", fontSize: 11, fontWeight: 700, fontFamily: FH, letterSpacing: "0.04em", display: "flex", alignItems: "center", gap: 8, borderBottom: `1px solid ${C.border}` }}>
           <span style={{ display: "inline-block", width: 8, height: 8, borderRadius: "50%", background: C.green, animation: "pulse 1.2s ease-in-out infinite" }} />
@@ -3952,16 +4464,17 @@ export default function App() {
       <div style={{ display: "flex", height: "100vh", background: C.dark, fontFamily: F, overflow: "hidden", paddingTop: offlineMode ? 34 : syncing ? 26 : 0 }}>
         <Sidebar activePage={activePage} setActivePage={p => { if (p !== "demand") setEditingOrderId(null); setActivePage(p); }} currentUser={currentUser} onLogout={handleLogout} badges={{ planning: orders.filter(o => o.status === "planning").length }} />
         <div style={{ flex: 1, overflow: "auto" }}>
-          {activePage === "demand" && <DemandPage orders={orders} addOrder={addOrder} updateOrder={updateOrder} deleteOrder={currentUser.role === "gestor" ? deleteOrder : null} cancelOrder={cancelOrder} currentUser={currentUser} addItem={addItem} fetchEvents={fetchEvents} eventsVersion={eventsVersion} logistics={logistics} shift={shift} isWorkDay={isWorkDay} registeredItems={registeredItems} clientHistory={clientHistory} addClient={addClient} editingOrderId={editingOrderId} setEditingOrderId={setEditingOrderId} setActivePage={setActivePage} calendarSettings={calendarSettings} dayOverrides={dayOverrides} />}
+          {activePage === "demand" && <DemandPage parts={parts} askParticularities={askParticularities} partChanges={partChanges} partEvent={partEvent} printOrderParts={printOrderParts} orders={orders} addOrder={addOrder} updateOrder={updateOrder} deleteOrder={currentUser.role === "gestor" ? deleteOrder : null} cancelOrder={cancelOrder} currentUser={currentUser} addItem={addItem} fetchEvents={fetchEvents} eventsVersion={eventsVersion} logistics={logistics} shift={shift} isWorkDay={isWorkDay} registeredItems={registeredItems} clientHistory={clientHistory} addClient={addClient} editingOrderId={editingOrderId} setEditingOrderId={setEditingOrderId} setActivePage={setActivePage} calendarSettings={calendarSettings} dayOverrides={dayOverrides} />}
           {activePage === "calendar" && <CalendarPage orders={orders} updateOrder={updateOrder} calendarSettings={calendarSettings} saveCalendarSettings={saveCalendarSettings} dayOverrides={dayOverrides} saveDayOverrides={saveDayOverrides} setEditingOrderId={openOrderId} setActivePage={goToPage} logistics={logistics} readOnly={isVendedor} />}
           {activePage === "planning" && <PlanningPage orders={orders} currentUser={currentUser} setEditingOrderId={openOrderId} setActivePage={goToPage} reactivateOrder={reactivateOrder} deleteOrder={deleteOrder} fetchEvents={fetchEvents} eventsVersion={eventsVersion} logistics={logistics} shift={shift} isWorkDay={isWorkDay} />}
-          {activePage === "open" && <OpenDemandsPage orders={orders} updateOrder={updateOrder} setEditingOrderId={openOrderId} setActivePage={goToPage} logistics={logistics} saveLogistics={saveLogistics} currentUser={currentUser} startExecution={startExecution} pauseExecution={pauseExecution} completeOrder={completeOrder} startTimerOnly={startTimerOnly} shift={shift} isWorkDay={isWorkDay} />}
-          {activePage === "logistics" && <LogisticsPage orders={orders} logistics={logistics} saveLogistics={saveLogistics} updateOrder={updateOrder} logEvent={logEvent} readOnly={currentUser.role === "vendedor"} />}
+          {activePage === "open" && <OpenDemandsPage parts={parts} askParticularities={askParticularities} partChanges={partChanges} partEvent={partEvent} printOrderParts={printOrderParts} orders={orders} updateOrder={updateOrder} setEditingOrderId={openOrderId} setActivePage={goToPage} logistics={logistics} saveLogistics={saveLogistics} currentUser={currentUser} startExecution={startExecution} pauseExecution={pauseExecution} completeOrder={completeOrder} startTimerOnly={startTimerOnly} shift={shift} isWorkDay={isWorkDay} />}
+          {activePage === "logistics" && <LogisticsPage parts={parts} askParticularities={askParticularities} partChanges={partChanges} partEvent={partEvent} printOrderParts={printOrderParts} orders={orders} logistics={logistics} saveLogistics={saveLogistics} updateOrder={updateOrder} logEvent={logEvent} readOnly={currentUser.role === "vendedor"} />}
           {activePage === "missing" && (currentUser.role === "gestor" || currentUser.role === "montador") && <MissingItemsPage orders={orders} updateOrder={updateOrder} setEditingOrderId={setEditingOrderId} setActivePage={setActivePage} />}
           {activePage === "items" && (currentUser.role === "gestor" || currentUser.role === "montador") && <ItemsPage registeredItems={registeredItems} addItem={addItem} updateItem={updateItem} deleteItem={deleteItem} />}
           {activePage === "reports" && currentUser.role === "gestor" && <ReportsPage orders={orders} registeredItems={registeredItems} calendarSettings={calendarSettings} dayOverrides={dayOverrides} />}
           {activePage === "export" && currentUser.role === "gestor" && <ExportPage orders={orders} registeredItems={registeredItems} fetchAllEvents={fetchAllEvents} logistics={logistics} />}
           {activePage === "clients" && (currentUser.role === "gestor" || currentUser.role === "montador") && <ClientsPage clientHistory={clientHistory} orders={orders} addClient={addClient} renameClient={renameClient} deleteClient={deleteClient} canManage={currentUser.role === "gestor"} />}
+          {activePage === "particularities" && <ParticularitiesPage parts={parts} partsReady={partsReady} clientHistory={clientHistory} registeredItems={registeredItems} orders={orders} currentUser={currentUser} addPart={addPart} updatePart={updatePart} setPartActive={setPartActive} />}
           {activePage === "users" && currentUser.role === "gestor" && <UsersPage users={users} addUser={addUser} updateUser={updateUser} deleteUser={deleteUser} currentUser={currentUser} />}
         </div>
       </div>

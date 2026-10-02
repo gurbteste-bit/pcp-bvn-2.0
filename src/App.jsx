@@ -823,7 +823,7 @@ function LoginPage({ users, onLogin }) {
             </div>
           </div>
           <div style={{ textAlign: "center", marginTop: 12, fontSize: 10, color: C.textDim, fontFamily: F }}>
-            v1.6.0
+            v1.6.1
           </div>
         </div>
       </div>
@@ -846,7 +846,7 @@ function Sidebar({ activePage, setActivePage, currentUser, onLogout, badges = {}
     { id: "reports", icon: "📊", label: "Relatórios", roles: ["gestor"] },
     { id: "export", icon: "📤", label: "Exportação", roles: ["gestor"] },
     { id: "particularities", icon: "⚑", label: "Particularidades", roles: ["gestor", "montador", "vendedor"] },
-    { id: "clients", icon: "🏢", label: "Clientes", roles: ["gestor", "montador"] },
+    { id: "clients", icon: "🏢", label: "Clientes", roles: ["gestor", "montador", "vendedor"] },
     { id: "users", icon: "👤", label: "Usuários", roles: ["gestor"] },
   ];
 
@@ -4473,7 +4473,7 @@ export default function App() {
           {activePage === "items" && (currentUser.role === "gestor" || currentUser.role === "montador") && <ItemsPage registeredItems={registeredItems} addItem={addItem} updateItem={updateItem} deleteItem={deleteItem} />}
           {activePage === "reports" && currentUser.role === "gestor" && <ReportsPage orders={orders} registeredItems={registeredItems} calendarSettings={calendarSettings} dayOverrides={dayOverrides} />}
           {activePage === "export" && currentUser.role === "gestor" && <ExportPage orders={orders} registeredItems={registeredItems} fetchAllEvents={fetchAllEvents} logistics={logistics} />}
-          {activePage === "clients" && (currentUser.role === "gestor" || currentUser.role === "montador") && <ClientsPage clientHistory={clientHistory} orders={orders} addClient={addClient} renameClient={renameClient} deleteClient={deleteClient} canManage={currentUser.role === "gestor"} />}
+          {activePage === "clients" && <ClientsPage clientHistory={clientHistory} orders={orders} addClient={addClient} renameClient={renameClient} deleteClient={deleteClient} canManage={currentUser.role === "gestor"} />}
           {activePage === "particularities" && <ParticularitiesPage parts={parts} partsReady={partsReady} clientHistory={clientHistory} registeredItems={registeredItems} orders={orders} currentUser={currentUser} addPart={addPart} updatePart={updatePart} setPartActive={setPartActive} />}
           {activePage === "users" && currentUser.role === "gestor" && <UsersPage users={users} addUser={addUser} updateUser={updateUser} deleteUser={deleteUser} currentUser={currentUser} />}
         </div>
